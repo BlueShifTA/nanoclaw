@@ -373,6 +373,14 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  // Load CLAUDE.local.md (machine-specific, gitignored) and append to system prompt
+  const localClaudeMdPath = '/workspace/group/CLAUDE.local.md';
+  let localClaudeMd: string | undefined;
+  if (fs.existsSync(localClaudeMdPath)) {
+    localClaudeMd = fs.readFileSync(localClaudeMdPath, 'utf-8');
+    log('Loaded CLAUDE.local.md');
+  }
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -396,8 +404,8 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: (globalClaudeMd || localClaudeMd)
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: [globalClaudeMd, localClaudeMd].filter(Boolean).join('\n\n') }
         : undefined,
       allowedTools: [
         'Bash',
