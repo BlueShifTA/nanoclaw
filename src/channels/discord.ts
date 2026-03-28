@@ -104,14 +104,23 @@ export class DiscordChannel implements Channel {
         for (const att of message.attachments.values()) {
           const contentType = att.contentType || '';
           const filename = att.name || 'file';
-          const typeLabel = contentType.startsWith('image/') ? 'Image'
-            : contentType.startsWith('video/') ? 'Video'
-            : contentType.startsWith('audio/') ? 'Audio'
-            : 'File';
+          const typeLabel = contentType.startsWith('image/')
+            ? 'Image'
+            : contentType.startsWith('video/')
+              ? 'Video'
+              : contentType.startsWith('audio/')
+                ? 'Audio'
+                : 'File';
 
           if (group && att.url) {
             try {
-              const inboundDir = path.join(DATA_DIR, 'ipc', group.folder, 'media', 'inbound');
+              const inboundDir = path.join(
+                DATA_DIR,
+                'ipc',
+                group.folder,
+                'media',
+                'inbound',
+              );
               fs.mkdirSync(inboundDir, { recursive: true });
               const safeFilename = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
               const filePath = path.join(inboundDir, safeFilename);
@@ -120,15 +129,26 @@ export class DiscordChannel implements Channel {
                 const buffer = Buffer.from(await response.arrayBuffer());
                 fs.writeFileSync(filePath, buffer);
                 const containerPath = `/workspace/ipc/media/inbound/${safeFilename}`;
-                attachmentLines.push(`[${typeLabel}: ${filename} — saved to ${containerPath}]`);
-                logger.info({ filename, size: buffer.length, containerPath }, 'Discord attachment downloaded');
+                attachmentLines.push(
+                  `[${typeLabel}: ${filename} — saved to ${containerPath}]`,
+                );
+                logger.info(
+                  { filename, size: buffer.length, containerPath },
+                  'Discord attachment downloaded',
+                );
               } else {
                 attachmentLines.push(`[${typeLabel}: ${filename}]`);
-                logger.warn({ filename, status: response.status }, 'Failed to download Discord attachment');
+                logger.warn(
+                  { filename, status: response.status },
+                  'Failed to download Discord attachment',
+                );
               }
             } catch (err) {
               attachmentLines.push(`[${typeLabel}: ${filename}]`);
-              logger.warn({ filename, err }, 'Error downloading Discord attachment');
+              logger.warn(
+                { filename, err },
+                'Error downloading Discord attachment',
+              );
             }
           } else {
             attachmentLines.push(`[${typeLabel}: ${filename}]`);
@@ -277,10 +297,7 @@ export class DiscordChannel implements Channel {
         files: [discordAttachment],
       });
 
-      logger.info(
-        { jid, filename: attachment.filename },
-        'Discord media sent',
-      );
+      logger.info({ jid, filename: attachment.filename }, 'Discord media sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord media');
     }

@@ -12,7 +12,12 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
-  sendMedia?: (jid: string, filePath: string, filename: string, caption?: string) => Promise<void>;
+  sendMedia?: (
+    jid: string,
+    filePath: string,
+    filename: string,
+    caption?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -92,7 +97,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
-              } else if (data.type === 'media' && data.chatJid && data.mediaFile) {
+              } else if (
+                data.type === 'media' &&
+                data.chatJid &&
+                data.mediaFile
+              ) {
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
@@ -108,9 +117,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       data.caption,
                     );
                     // Clean up the media file after sending
-                    try { fs.unlinkSync(absoluteMediaPath); } catch {}
+                    try {
+                      fs.unlinkSync(absoluteMediaPath);
+                    } catch {}
                     logger.info(
-                      { chatJid: data.chatJid, sourceGroup, filename: data.filename },
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        filename: data.filename,
+                      },
                       'IPC media sent',
                     );
                   } else if (!deps.sendMedia && data.caption) {
@@ -122,7 +137,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     );
                   } else {
                     logger.warn(
-                      { chatJid: data.chatJid, sourceGroup, mediaFile: data.mediaFile },
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        mediaFile: data.mediaFile,
+                      },
                       'IPC media: file not found or no sendMedia handler',
                     );
                   }
