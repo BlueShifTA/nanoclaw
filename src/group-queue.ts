@@ -1,4 +1,4 @@
-import { ChildProcess } from 'child_process';
+import { ChildProcess, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -342,6 +342,45 @@ export class GroupQueue {
       }
       // If neither pending, skip this group
     }
+  }
+
+  /**
+   * Force-kill the active container for a group via `docker kill`.
+   * Returns true if a container was found and kill was attempted.
+   * Use when the agent is drifted and closeStdin won't unblock it.
+   */
+  kill(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    if (!state?.containerName) return false;
+    try {
+      execSync(`docker kill ${state.containerName}`, { stdio: 'pipe' });
+      logger.info(
+        { groupJid, containerName: state.containerName },
+        'Container force-killed',
+      );
+      return true;
+    } catch (err) {
+      logger.warn(
+        { groupJid, containerName: state.containerName, err },
+        'docker kill failed',
+      );
+      return false;
+    }
+  }
+
+  getStatus(groupJid: string): {
+    active: boolean;
+    idleWaiting: boolean;
+    isTaskContainer: boolean;
+    containerName: string | null;
+  } {
+    const state = this.groups.get(groupJid);
+    return {
+      active: state?.active ?? false,
+      idleWaiting: state?.idleWaiting ?? false,
+      isTaskContainer: state?.isTaskContainer ?? false,
+      containerName: state?.containerName ?? null,
+    };
   }
 
   async shutdown(_gracePeriodMs: number): Promise<void> {

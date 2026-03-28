@@ -71,3 +71,9 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// How long an active container can be silent before /ping flags it as drifted
+export const DRIFT_THRESHOLD_MS = parseInt(
+  process.env.DRIFT_THRESHOLD_MS || '300000', // 5 minutes
+  10,
+);
