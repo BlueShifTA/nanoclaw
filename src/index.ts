@@ -4,11 +4,13 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DRIFT_THRESHOLD_MS,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
+import { loadDriftState, saveDriftState } from './drift-state.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
@@ -27,10 +29,12 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  deleteSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getLastBotMessages,
   getMessagesSince,
   getNewMessages,
   getRegisteredGroup,
@@ -68,6 +72,8 @@ let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+let lastAgentOutput: Record<string, { time: number; text: string }> = {};
+let containerStartTime: Record<string, number> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -84,6 +90,9 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  const driftState = loadDriftState();
+  lastAgentOutput = driftState.lastAgentOutput;
+  containerStartTime = driftState.containerStartTime;
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -209,6 +218,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  containerStartTime[chatJid] = Date.now();
+  saveDriftState({ lastAgentOutput, containerStartTime });
   let hadError = false;
   let outputSentToUser = false;
 
@@ -223,6 +234,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
+        lastAgentOutput[chatJid] = {
+          time: Date.now(),
+          text: text.slice(0, 120),
+        };
+        saveDriftState({ lastAgentOutput, containerStartTime });
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
@@ -536,6 +552,260 @@ async function main(): Promise<void> {
     }
   }
 
+  function humanDuration(ms: number): string {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+
+  // Handle /ping — instant orchestrator health check + optional agent status
+  async function handlePing(chatJid: string): Promise<void> {
+    const group = registeredGroups[chatJid];
+    if (!group) return;
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    const status = queue.getStatus(chatJid);
+    const sessionId = sessions[group.folder];
+    const lastActivity = lastAgentTimestamp[chatJid];
+    const now = Date.now();
+
+    let agentLine: string;
+    let driftWarning = '';
+
+    if (status.active && status.isTaskContainer) {
+      const runningFor = containerStartTime[chatJid]
+        ? humanDuration(now - containerStartTime[chatJid])
+        : 'unknown';
+      agentLine = `Agent: running scheduled task (${runningFor})`;
+    } else if (status.active && status.idleWaiting) {
+      agentLine = `Agent: idle (container alive, waiting for input)`;
+    } else if (status.active) {
+      const runningFor = containerStartTime[chatJid]
+        ? humanDuration(now - containerStartTime[chatJid])
+        : 'unknown';
+      const lastOut = lastAgentOutput[chatJid];
+      const silentFor = lastOut
+        ? now - lastOut.time
+        : containerStartTime[chatJid]
+          ? now - containerStartTime[chatJid]
+          : null;
+
+      agentLine = `Agent: processing (running ${runningFor})`;
+
+      if (silentFor !== null && silentFor > DRIFT_THRESHOLD_MS) {
+        driftWarning = `⚠️ Possible drift — silent for ${humanDuration(silentFor)}. Use /kill to force-stop or /reset to recover.`;
+      } else if (silentFor !== null) {
+        agentLine += `, last output ${humanDuration(silentFor)} ago`;
+      }
+    } else {
+      agentLine = `Agent: idle (no active container)`;
+    }
+
+    const sessionLine = sessionId
+      ? `Session: ${sessionId.slice(0, 8)}…`
+      : `Session: none`;
+    const activityLine = lastActivity
+      ? `Last activity: ${new Date(lastActivity).toLocaleString('en-CH', { timeZone: TIMEZONE })}`
+      : `Last activity: none`;
+
+    const lastOut = lastAgentOutput[chatJid];
+    const lastOutputLine = lastOut
+      ? `Last output: "${lastOut.text.replace(/\n/g, ' ')}${lastOut.text.length >= 120 ? '…' : ''}"`
+      : null;
+
+    const lines = [`NanoClaw alive`, agentLine, sessionLine, activityLine];
+    if (lastOutputLine) lines.push(lastOutputLine);
+    if (driftWarning) lines.push(driftWarning);
+
+    await channel.sendMessage(chatJid, lines.join('\n'));
+
+    // If a container is active and not drifted, ask the agent for a brief status.
+    // Queued in IPC — agent responds after current work, never interrupts.
+    if (status.active && !status.isTaskContainer && !driftWarning) {
+      const pingPrompt =
+        `[ping] Briefly summarise what you're currently doing or just finished ` +
+        `(1–2 sentences max), then continue your work uninterrupted.`;
+      queue.sendMessage(chatJid, pingPrompt);
+      logger.debug({ group: group.name }, 'Ping forwarded to active agent');
+    }
+  }
+
+  // Handle /last [n] — show last N bot responses from DB (default 1)
+  async function handleLast(chatJid: string, arg: string): Promise<void> {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    const n = Math.min(Math.max(parseInt(arg) || 1, 1), 10);
+    const msgs = getLastBotMessages(chatJid, n);
+
+    if (msgs.length === 0) {
+      await channel.sendMessage(chatJid, 'No agent responses found.');
+      return;
+    }
+
+    const lines = msgs.map((m, i) => {
+      const time = new Date(m.timestamp).toLocaleString('en-CH', {
+        timeZone: TIMEZONE,
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const prefix = msgs.length > 1 ? `[${i + 1}] ${time}\n` : `${time}\n`;
+      return prefix + m.content;
+    });
+
+    await channel.sendMessage(chatJid, lines.join('\n\n---\n'));
+  }
+
+  // Handle /kill — force-stop a stuck/drifted container
+  async function handleKill(chatJid: string): Promise<void> {
+    const group = registeredGroups[chatJid];
+    if (!group) return;
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    const status = queue.getStatus(chatJid);
+    if (!status.active) {
+      await channel.sendMessage(chatJid, 'No active container to kill.');
+      return;
+    }
+
+    const killed = queue.kill(chatJid);
+    if (killed) {
+      logger.info({ group: group.name }, 'Container force-killed via /kill');
+      await channel.sendMessage(
+        chatJid,
+        `Container killed. Session preserved — use /reset if you want a fresh start.`,
+      );
+    } else {
+      await channel.sendMessage(
+        chatJid,
+        'Kill failed — container may have already exited.',
+      );
+    }
+  }
+
+  // Handle /reset — summarise session to journal + memory, then clear
+  async function handleReset(chatJid: string): Promise<void> {
+    const group = registeredGroups[chatJid];
+    if (!group) return;
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    // Capture session ID now — must stay intact while runAgent uses it
+    const sessionIdForSummary = sessions[group.folder];
+
+    if (!sessionIdForSummary) {
+      // Nothing to summarise — just clear state
+      lastAgentTimestamp[chatJid] = new Date().toISOString();
+      saveState();
+      await channel.sendMessage(
+        chatJid,
+        'No active session to summarise. State cleared.',
+      );
+      return;
+    }
+
+    await channel.sendMessage(chatJid, 'Summarising session before reset...');
+
+    // Hard-kill any active container so it doesn't write concurrently
+    // while we summarise. Fall back to closeStdin if no containerName yet.
+    if (!queue.kill(chatJid)) queue.closeStdin(chatJid);
+
+    const now = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const summarisePrompt = `Before this session is reset, do the following in order:
+
+1. **Write a journal entry** to \`/workspace/extra/armlab/journal/${now}.md\` (create the directory if needed) with:
+   - Date/time header
+   - Summary of everything discussed and decided in this session
+   - Any tasks completed, in-progress, or pending
+   - Important context, decisions, or open questions
+
+2. **Update persistent memory** in \`/workspace/group/CLAUDE.md\` by appending a brief "## Session ${now}" section with:
+   - Key facts or decisions that should be remembered in future sessions
+   - Any client/project status updates worth retaining
+   - Skip anything already in the file
+
+3. Reply with a short confirmation of what you saved (2–3 sentences max).
+
+Do NOT do anything else. This is a pre-reset snapshot.`;
+
+    // Always use runAgent (awaited) so journal is fully written before we clear.
+    // Session ID is still intact at this point so the agent has full history.
+    await channel.setTyping?.(chatJid, true);
+    await runAgent(group, summarisePrompt, chatJid, async (result) => {
+      if (result.result) {
+        const text =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const clean = text
+          .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+          .trim();
+        if (clean) await channel.sendMessage(chatJid, clean);
+      }
+    });
+    await channel.setTyping?.(chatJid, false);
+
+    // Only now — after summary is complete — clear the session
+    delete sessions[group.folder];
+    deleteSession(group.folder);
+    delete lastAgentOutput[chatJid];
+    delete containerStartTime[chatJid];
+    saveDriftState({ lastAgentOutput, containerStartTime });
+
+    // Advance cursor so old messages are not replayed
+    lastAgentTimestamp[chatJid] = new Date().toISOString();
+    saveState();
+
+    logger.info({ group: group.name }, 'Session reset via /reset command');
+    await channel.sendMessage(
+      chatJid,
+      'Session cleared. Ready for a fresh start.',
+    );
+  }
+
+  // Handle /compact — compact context of the current session
+  async function handleCompact(chatJid: string): Promise<void> {
+    const group = registeredGroups[chatJid];
+    if (!group) return;
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    // Guard: no point compacting if there's no existing session to compact
+    if (!sessions[group.folder]) {
+      await channel.sendMessage(chatJid, 'No active session to compact.');
+      return;
+    }
+
+    // If a container is active, pipe /compact directly to it
+    if (queue.sendMessage(chatJid, '/compact')) {
+      logger.info({ group: group.name }, 'Piped /compact to active container');
+      return;
+    }
+
+    // No active container — resume existing session and run /compact
+    logger.info({ group: group.name }, 'Running /compact in new container');
+    await channel.setTyping?.(chatJid, true);
+    await runAgent(group, '/compact', chatJid, async (result) => {
+      if (result.result) {
+        const text =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const clean = text
+          .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+          .trim();
+        if (clean) await channel.sendMessage(chatJid, clean);
+      }
+    });
+    await channel.setTyping?.(chatJid, false);
+  }
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
@@ -545,6 +815,67 @@ async function main(): Promise<void> {
         handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Remote control command error'),
         );
+        return;
+      }
+
+      // /ping — instant health check, answered by orchestrator directly
+      if (trimmed === '/ping') {
+        if (!registeredGroups[chatJid]) return;
+        handlePing(chatJid).catch((err) =>
+          logger.error({ err, chatJid }, '/ping command error'),
+        );
+        return;
+      }
+
+      // /last [n] — show last N messages from DB
+      if (trimmed.startsWith('/last')) {
+        if (!registeredGroups[chatJid]) return;
+        const arg = trimmed.slice(5).trim();
+        handleLast(chatJid, arg).catch((err) =>
+          logger.error({ err, chatJid }, '/last command error'),
+        );
+        return;
+      }
+
+      // Session management commands — intercept before storage
+      if (
+        trimmed === '/reset' ||
+        trimmed === '/compact' ||
+        trimmed === '/kill'
+      ) {
+        if (!registeredGroups[chatJid]) return;
+        if (trimmed === '/reset') {
+          handleReset(chatJid).catch((err) =>
+            logger.error({ err, chatJid }, '/reset command error'),
+          );
+        } else if (trimmed === '/compact') {
+          handleCompact(chatJid).catch((err) =>
+            logger.error({ err, chatJid }, '/compact command error'),
+          );
+        } else {
+          handleKill(chatJid).catch((err) =>
+            logger.error({ err, chatJid }, '/kill command error'),
+          );
+        }
+        return;
+      }
+
+      // /btw <note> — inject context into active container or queue for next run
+      // No trigger required; agent acknowledges only if relevant.
+      if (trimmed.startsWith('/btw ') || trimmed === '/btw') {
+        if (!registeredGroups[chatJid]) return;
+        const note = trimmed.slice(5).trim();
+        if (!note) return;
+        const btwText = `[btw — side note, no response needed unless relevant]: ${note}`;
+        if (queue.sendMessage(chatJid, btwText)) {
+          // Piped into active container; don't store separately
+          logger.debug({ chatJid }, '/btw piped to active container');
+        } else {
+          // No active container — store as a regular message so it becomes
+          // context on the next agent run (bypasses trigger requirement below)
+          storeMessage({ ...msg, content: btwText });
+          lastAgentTimestamp[chatJid] = lastAgentTimestamp[chatJid] || '';
+        }
         return;
       }
 
@@ -619,6 +950,16 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendMedia: async (jid, filePath, filename, caption) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (channel.sendMedia) {
+        await channel.sendMedia(jid, { filePath, filename, caption });
+      } else if (caption) {
+        // Fallback for channels without media support
+        await channel.sendMessage(jid, caption);
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
