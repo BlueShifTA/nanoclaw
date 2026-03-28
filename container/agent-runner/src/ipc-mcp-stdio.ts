@@ -63,6 +63,57 @@ server.tool(
 );
 
 server.tool(
+  'send_media',
+  `Send a file (image, video, document) to the user or group. The file must exist at an accessible path inside the container. Use this after generating charts, screenshots, or downloading files.
+
+The file is copied to the IPC directory so it persists after the container exits. Discord has a ~25MB file size limit.`,
+  {
+    file_path: z.string().describe('Absolute path to the file inside the container (e.g., /workspace/group/chart.png)'),
+    filename: z.string().optional().describe('Display name for the file (defaults to basename of file_path)'),
+    caption: z.string().optional().describe('Optional text caption sent with the media'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    const stat = fs.statSync(args.file_path);
+    const MAX_SIZE = 25 * 1024 * 1024; // 25MB Discord limit
+    if (stat.size > MAX_SIZE) {
+      return {
+        content: [{ type: 'text' as const, text: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Discord limit is 25MB.` }],
+        isError: true,
+      };
+    }
+
+    const filename = args.filename || path.basename(args.file_path);
+
+    // Copy file to IPC media directory so host can access it after container exits
+    const mediaDir = path.join(IPC_DIR, 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const mediaFilename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${filename}`;
+    const mediaPath = path.join(mediaDir, mediaFilename);
+    fs.copyFileSync(args.file_path, mediaPath);
+
+    // Write IPC message referencing the copied file
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'media',
+      chatJid,
+      mediaFile: mediaFilename,
+      filename,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: `Media "${filename}" sent.` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 

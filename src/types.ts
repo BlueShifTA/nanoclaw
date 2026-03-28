@@ -77,12 +77,24 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+// --- Media ---
+
+export interface MediaAttachment {
+  /** Absolute path to the file on the host filesystem */
+  filePath: string;
+  /** Original filename for the attachment (shown to recipients) */
+  filename: string;
+  /** Optional caption/text sent alongside the media */
+  caption?: string;
+}
+
 // --- Channel abstraction ---
 
 export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  sendMedia?(jid: string, attachment: MediaAttachment): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

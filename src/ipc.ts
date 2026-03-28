@@ -12,6 +12,7 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMedia?: (jid: string, filePath: string, filename: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -89,6 +90,46 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'media' && data.chatJid && data.mediaFile) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  const mediaDir = path.join(ipcBaseDir, sourceGroup, 'media');
+                  const absoluteMediaPath = path.join(mediaDir, data.mediaFile);
+                  if (fs.existsSync(absoluteMediaPath) && deps.sendMedia) {
+                    await deps.sendMedia(
+                      data.chatJid,
+                      absoluteMediaPath,
+                      data.filename || data.mediaFile,
+                      data.caption,
+                    );
+                    // Clean up the media file after sending
+                    try { fs.unlinkSync(absoluteMediaPath); } catch {}
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, filename: data.filename },
+                      'IPC media sent',
+                    );
+                  } else if (!deps.sendMedia && data.caption) {
+                    // Fallback: send caption as text if channel doesn't support media
+                    await deps.sendMessage(data.chatJid, data.caption);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC media fallback: sent caption as text',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup, mediaFile: data.mediaFile },
+                      'IPC media: file not found or no sendMedia handler',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC media attempt blocked',
                   );
                 }
               }

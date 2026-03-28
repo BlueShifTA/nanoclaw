@@ -1,11 +1,22 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import {
+  AttachmentBuilder,
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  TextChannel,
+} from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import fs from 'fs';
+import path from 'path';
+
+import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  MediaAttachment,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -86,24 +97,47 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle attachments — store placeholders so the agent knows something was sent
+      // Handle attachments — download to IPC inbound dir so the agent can read them
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map((att) => {
+        const group = this.opts.registeredGroups()[chatJid];
+        const attachmentLines: string[] = [];
+        for (const att of message.attachments.values()) {
           const contentType = att.contentType || '';
-          if (contentType.startsWith('image/')) {
-            return `[Image: ${att.name || 'image'}]`;
-          } else if (contentType.startsWith('video/')) {
-            return `[Video: ${att.name || 'video'}]`;
-          } else if (contentType.startsWith('audio/')) {
-            return `[Audio: ${att.name || 'audio'}]`;
+          const filename = att.name || 'file';
+          const typeLabel = contentType.startsWith('image/') ? 'Image'
+            : contentType.startsWith('video/') ? 'Video'
+            : contentType.startsWith('audio/') ? 'Audio'
+            : 'File';
+
+          if (group && att.url) {
+            try {
+              const inboundDir = path.join(DATA_DIR, 'ipc', group.folder, 'media', 'inbound');
+              fs.mkdirSync(inboundDir, { recursive: true });
+              const safeFilename = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+              const filePath = path.join(inboundDir, safeFilename);
+              const response = await fetch(att.url);
+              if (response.ok) {
+                const buffer = Buffer.from(await response.arrayBuffer());
+                fs.writeFileSync(filePath, buffer);
+                const containerPath = `/workspace/ipc/media/inbound/${safeFilename}`;
+                attachmentLines.push(`[${typeLabel}: ${filename} — saved to ${containerPath}]`);
+                logger.info({ filename, size: buffer.length, containerPath }, 'Discord attachment downloaded');
+              } else {
+                attachmentLines.push(`[${typeLabel}: ${filename}]`);
+                logger.warn({ filename, status: response.status }, 'Failed to download Discord attachment');
+              }
+            } catch (err) {
+              attachmentLines.push(`[${typeLabel}: ${filename}]`);
+              logger.warn({ filename, err }, 'Error downloading Discord attachment');
+            }
           } else {
-            return `[File: ${att.name || 'file'}]`;
+            attachmentLines.push(`[${typeLabel}: ${filename}]`);
           }
-        });
+        }
         if (content) {
-          content = `${content}\n${attachmentDescriptions.join('\n')}`;
+          content = `${content}\n${attachmentLines.join('\n')}`;
         } else {
-          content = attachmentDescriptions.join('\n');
+          content = attachmentLines.join('\n');
         }
       }
 
@@ -125,7 +159,13 @@ export class DiscordChannel implements Channel {
 
       // Store chat metadata for discovery
       const isGroup = message.guild !== null;
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'discord',
+        isGroup,
+      );
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
@@ -165,6 +205,10 @@ export class DiscordChannel implements Channel {
           { username: readyClient.user.tag, id: readyClient.user.id },
           'Discord bot connected',
         );
+        const guildList = readyClient.guilds.cache.map(
+          (g) => `${g.name} (${g.id})`,
+        );
+        logger.info({ guilds: guildList }, 'Discord bot guilds');
         console.log(`\n  Discord bot: ${readyClient.user.tag}`);
         console.log(
           `  Use /chatid command or check channel IDs in Discord settings\n`,
@@ -205,6 +249,40 @@ export class DiscordChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
+    }
+  }
+
+  async sendMedia(jid: string, attachment: MediaAttachment): Promise<void> {
+    if (!this.client) {
+      logger.warn('Discord client not initialized');
+      return;
+    }
+
+    try {
+      const channelId = jid.replace(/^dc:/, '');
+      const channel = await this.client.channels.fetch(channelId);
+
+      if (!channel || !('send' in channel)) {
+        logger.warn({ jid }, 'Discord channel not found or not text-based');
+        return;
+      }
+
+      const textChannel = channel as TextChannel;
+      const discordAttachment = new AttachmentBuilder(attachment.filePath, {
+        name: attachment.filename,
+      });
+
+      await textChannel.send({
+        content: attachment.caption || undefined,
+        files: [discordAttachment],
+      });
+
+      logger.info(
+        { jid, filename: attachment.filename },
+        'Discord media sent',
+      );
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Discord media');
     }
   }
 
