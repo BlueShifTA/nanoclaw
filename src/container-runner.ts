@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -165,6 +166,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount Codex CLI auth so containers can use the host's login
+  const codexAuthFile = path.join(os.homedir(), '.codex', 'auth.json');
+  if (fs.existsSync(codexAuthFile)) {
+    mounts.push({
+      hostPath: codexAuthFile,
+      containerPath: '/home/node/.codex/auth.json',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -248,6 +259,13 @@ async function buildContainerArgs(
       'OneCLI gateway not reachable — container will have no credentials',
     );
   }
+
+  // Exclude local host services from the OneCLI proxy so containers
+  // can reach host-side APIs (e.g. Command Center on ports 5001/5002).
+  args.push(
+    '-e',
+    'NO_PROXY=host.docker.internal,localhost,127.0.0.1',
+  );
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());

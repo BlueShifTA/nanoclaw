@@ -36,8 +36,8 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp /root/.local/bin/uvx /usr/local/bin/uvx \
     && rm -rf /root/.local/bin/uv /root/.local/bin/uvx
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser, claude-code, and codex CLI globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex
 
 # Create app directory
 WORKDIR /app
