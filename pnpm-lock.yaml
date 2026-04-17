@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@chat-adapter/shared':
-        specifier: ^4.24.0
-        version: 4.26.0
       '@onecli-sh/sdk':
         specifier: ^0.3.1
         version: 0.3.1
@@ -65,9 +62,6 @@ importers:
         version: 4.1.4(@types/node@22.19.17)(vite@8.0.8(@types/node@22.19.17)(esbuild@0.27.7)(tsx@4.21.0))
 
 packages:
-
-  '@chat-adapter/shared@4.26.0':
-    resolution: {integrity: sha512-YD0MGktFXrArUqTBsyPfL5vkdD1WBS58PAWO0oVrMQAMmPxpAXfWGjBtZCkf3y8R8Svb0uVuVXiMZSForaEnMQ==}
 
   '@emnapi/core@1.9.2':
     resolution: {integrity: sha512-UC+ZhH3XtczQYfOlu3lNEkdW/p4dsJ1r/bP7H8+rhao3TTTMO1ATq/4DdIi23XuGoFY+Cz0JmCbdVl0hz9jZcA==}
@@ -1515,12 +1509,6 @@ packages:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
 
 snapshots:
-
-  '@chat-adapter/shared@4.26.0':
-    dependencies:
-      chat: 4.26.0
-    transitivePeerDependencies:
-      - supports-color
 
   '@emnapi/core@1.9.2':
     dependencies:
