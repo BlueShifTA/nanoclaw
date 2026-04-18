@@ -36,8 +36,23 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp /root/.local/bin/uvx /usr/local/bin/uvx \
     && rm -rf /root/.local/bin/uv /root/.local/bin/uvx
 
-# Install agent-browser, claude-code, and codex CLI globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex
+# Install agent-browser, claude-code, codex CLI, and codeburn globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex codeburn
+
+# Install rtk (token-saving CLI proxy) — musl-static binary, always pulls latest release
+# Using musl build to avoid glibc version mismatch with node:22-slim (bookworm, glibc 2.36)
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) RTK_ASSET=rtk-x86_64-unknown-linux-musl.tar.gz ;; \
+         arm64) RTK_ASSET=rtk-aarch64-unknown-linux-gnu.tar.gz ;; \
+         *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
+       esac \
+    && curl -LsSf -o /tmp/rtk.tar.gz "https://github.com/rtk-ai/rtk/releases/latest/download/${RTK_ASSET}" \
+    && tar -xzf /tmp/rtk.tar.gz -C /tmp \
+    && mv /tmp/rtk /usr/local/bin/rtk \
+    && chmod +x /usr/local/bin/rtk \
+    && rm /tmp/rtk.tar.gz \
+    && rtk --version
 
 # Create app directory
 WORKDIR /app
