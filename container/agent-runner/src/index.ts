@@ -477,6 +477,8 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        'mcp__serena__*',
+        'mcp__context7__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -491,6 +493,19 @@ async function runQuery(
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
+        },
+        serena: {
+          command: 'serena',
+          args: [
+            'start-mcp-server',
+            '--context',
+            'claude-code',
+            '--project-from-cwd',
+          ],
+        },
+        context7: {
+          command: 'context7-mcp',
+          args: [],
         },
       },
       hooks: {

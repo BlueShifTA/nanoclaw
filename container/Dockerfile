@@ -44,8 +44,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp /root/.local/bin/uvx /usr/local/bin/uvx \
     && rm -rf /root/.local/bin/uv /root/.local/bin/uvx
 
-# Install agent-browser, claude-code, codex CLI, and codeburn globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex codeburn
+# Install agent-browser, claude-code, codex CLI, codeburn, and context7-mcp globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex codeburn @upstash/context7-mcp
+
+# Install Serena MCP server (semantic code navigation) via uv tool
+# UV_TOOL_{DIR,BIN_DIR} makes the install accessible to the non-root `node` user.
+ENV UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv tool install -p 3.13 'serena-agent@latest' --prerelease=allow \
+    && chmod -R a+rX /opt/uv-tools /opt/uv-python \
+    && serena --help > /dev/null
 
 # Install rtk (token-saving CLI proxy) — musl-static binary, always pulls latest release
 # Using musl build to avoid glibc version mismatch with node:22-slim (bookworm, glibc 2.36)

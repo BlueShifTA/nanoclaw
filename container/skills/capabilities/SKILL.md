@@ -39,7 +39,10 @@ Read the allowed tools from your SDK configuration. You always have access to:
 - **Web:** WebSearch, WebFetch
 - **Orchestration:** Task, TaskOutput, TaskStop, TeamCreate, TeamDelete, SendMessage
 - **Other:** TodoWrite, ToolSearch, Skill, NotebookEdit
-- **MCP:** mcp__nanoclaw__* (messaging, tasks, group management)
+- **MCP:**
+  - `mcp__nanoclaw__*` — messaging, tasks, group management
+  - `mcp__serena__*` — semantic code navigation, symbol lookup, refactor assists
+  - `mcp__context7__*` — up-to-date library/framework documentation lookup
 
 ### 3. MCP server tools
 
@@ -53,13 +56,27 @@ The NanoClaw MCP server exposes these tools (via `mcp__nanoclaw__*` prefix):
 - `update_task` — update an existing task
 - `register_group` — register a new chat/group (main only)
 
-### 4. Container skills (Bash tools)
+### 4. Container CLIs (Bash tools)
 
 Check for executable tools in the container:
 
 ```bash
-which agent-browser 2>/dev/null && echo "agent-browser: available" || echo "agent-browser: not found"
+for cmd in agent-browser gh rtk codeburn serena context7-mcp uv uvx codex claude; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "$cmd: available ($(command -v $cmd))"
+  else
+    echo "$cmd: not found"
+  fi
+done
 ```
+
+Highlights of what's pre-installed:
+- `gh` — GitHub CLI, authenticated via OneCLI proxy injection (api.github.com requests get the vaulted token automatically — do NOT pass `--with-token`)
+- `rtk` — token-saving CLI proxy (wraps commands transparently when invoked as `rtk <cmd>`)
+- `codeburn` — local AI coding token analytics (`codeburn status`, `codeburn report`)
+- `serena` — started as MCP server; also usable standalone for indexing
+- `codex` — OpenAI Codex CLI (shares host auth)
+- `uv` / `uvx` — Python package manager for ad-hoc scripts
 
 ### 5. Group info
 
