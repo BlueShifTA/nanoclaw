@@ -21,9 +21,29 @@ groups/global/*
 # Local overrides (machine-specific, never committed)
 groups/*/CLAUDE.local.md
 
-# Secrets
+# Secrets — never commit tokens, keys, credentials, or local envs
 *.keys.json
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.authinfo
+*.token
+*_token
+*_token.txt
+credentials.json
+secrets.json
+.onecli/
+# One-off local scripts (e.g. test-*.mjs, scratch-*.ts)
+test-*.mjs
+test-*.ts
+!**/src/**/test-*.ts
+scratch-*
+scratch/
 
 # Temp files
 .tmp-*
