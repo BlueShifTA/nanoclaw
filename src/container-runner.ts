@@ -284,6 +284,11 @@ async function buildContainerArgs(
   // can reach host-side APIs (e.g. Command Center on ports 5001/5002).
   args.push('-e', 'NO_PROXY=host.docker.internal,localhost,127.0.0.1');
 
+  // gh CLI needs a token present to make requests; OneCLI proxy MITMs
+  // api.github.com and replaces Authorization with the real vaulted token.
+  // The dummy keeps the real PAT out of the container env.
+  args.push('-e', 'GH_TOKEN=gho_dummy');
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
