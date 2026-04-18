@@ -282,10 +282,7 @@ async function buildContainerArgs(
 
   // Exclude local host services from the OneCLI proxy so containers
   // can reach host-side APIs (e.g. Command Center on ports 5001/5002).
-  args.push(
-    '-e',
-    'NO_PROXY=host.docker.internal,localhost,127.0.0.1',
-  );
+  args.push('-e', 'NO_PROXY=host.docker.internal,localhost,127.0.0.1');
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
