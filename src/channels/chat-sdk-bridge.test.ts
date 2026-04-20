@@ -9,7 +9,9 @@ function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
 }
 
-function cfg(partial: Partial<ConversationConfig> & { engageMode: ConversationConfig['engageMode'] }): ConversationConfig {
+function cfg(
+  partial: Partial<ConversationConfig> & { engageMode: ConversationConfig['engageMode'] },
+): ConversationConfig {
   return {
     platformId: partial.platformId ?? 'C1',
     agentGroupId: partial.agentGroupId ?? 'ag-1',
