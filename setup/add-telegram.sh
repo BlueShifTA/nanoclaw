@@ -134,21 +134,24 @@ mkdir -p data/env
 cp .env data/env/env
 
 # Deep-link into the bot's chat in the installed Telegram app so the user
-# is already on the right screen when pair-telegram prints the code.
+# is already on the right screen when pair-telegram prints the code. Also
+# always print the URL so headless / remote-SSH users can open it manually.
 if [[ -n "$BOT_USERNAME" ]]; then
+  BOT_URL="https://t.me/${BOT_USERNAME}"
   case "$(uname -s)" in
     Darwin)
       open "tg://resolve?domain=${BOT_USERNAME}" >/dev/null 2>&1 \
-        || open "https://t.me/${BOT_USERNAME}" >/dev/null 2>&1 \
+        || open "$BOT_URL" >/dev/null 2>&1 \
         || true
       ;;
     Linux)
       xdg-open "tg://resolve?domain=${BOT_USERNAME}" >/dev/null 2>&1 \
-        || xdg-open "https://t.me/${BOT_USERNAME}" >/dev/null 2>&1 \
+        || xdg-open "$BOT_URL" >/dev/null 2>&1 \
         || true
       ;;
   esac
-  echo "[add-telegram] Opened Telegram → @${BOT_USERNAME}. Keep it open for the pairing code."
+  echo "[add-telegram] Bot chat: ${BOT_URL}"
+  echo "[add-telegram] (If Telegram didn't open automatically, click the link above.)"
 fi
 
 echo "[add-telegram] Restarting service so the new adapter picks up the token…"
