@@ -38,10 +38,8 @@ import { brightSelect } from './lib/bright-select.js';
 import { offerClaudeAssist } from './lib/claude-assist.js';
 import { runWindowedStep } from './lib/windowed-runner.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
-import {
-  claudeCliAvailable,
-  resolveTimezoneViaClaude,
-} from './lib/tz-from-claude.js';
+import { pollHealth } from './onecli.js';
+import { claudeCliAvailable, resolveTimezoneViaClaude } from './lib/tz-from-claude.js';
 import * as setupLog from './logs.js';
 import { ensureAnswer, fail, runQuietChild, runQuietStep } from './lib/runner.js';
 import { emit as phEmit } from './lib/diagnostics.js';
@@ -51,15 +49,7 @@ import { isValidTimezone } from '../src/timezone.js';
 const CLI_AGENT_NAME = 'Terminal Agent';
 const RUN_START = Date.now();
 
-type ChannelChoice =
-  | 'telegram'
-  | 'discord'
-  | 'whatsapp'
-  | 'signal'
-  | 'teams'
-  | 'slack'
-  | 'imessage'
-  | 'skip';
+type ChannelChoice = 'telegram' | 'discord' | 'whatsapp' | 'signal' | 'teams' | 'slack' | 'imessage' | 'skip';
 
 async function main(): Promise<void> {
   printIntro();
@@ -88,12 +78,7 @@ async function main(): Promise<void> {
   }
 
   if (!skip.has('container')) {
-    p.log.message(
-      dimWrap(
-        'Your assistant lives in its own sandbox. It can only see what you explicitly share.',
-        4,
-      ),
-    );
+    p.log.message(dimWrap('Your assistant lives in its own sandbox. It can only see what you explicitly share.', 4));
     p.log.message(
       dimWrap(
         'The first build pulls a base image and installs a few tools. On a fresh machine this usually takes 3–10 minutes.',
@@ -138,45 +123,96 @@ async function main(): Promise<void> {
       ),
     );
 
-    // Respect an existing OneCLI install. Re-running the installer would
-    // rebind the listener and knock any other app using that gateway
-    // offline — confirm with the user before doing that.
+    type OnecliChoice = 'reuse' | 'fresh' | 'remote';
+
     const existing = detectExistingOnecli();
-    let reuse = false;
-    if (existing) {
-      const choice = ensureAnswer(
-        await brightSelect({
-          message: `Found an existing OneCLI at ${existing.apiHost}. What would you like to do?`,
-          options: [
+    const onecliOptions: { value: OnecliChoice; label: string; hint?: string }[] = [
+      ...(existing
+        ? [
             {
-              value: 'reuse',
-              label: 'Use the existing instance',
+              value: 'reuse' as OnecliChoice,
+              label: 'Use the existing instance on the same host',
               hint: 'recommended — keeps other apps bound to this vault working',
             },
-            {
-              value: 'fresh',
-              label: 'Install a fresh instance for NanoClaw',
-              hint: 'reinstalls onecli; other apps may need to reconnect',
+          ]
+        : []),
+      {
+        value: 'fresh',
+        label: 'Install a fresh instance for NanoClaw',
+        hint: existing ? 'reinstalls onecli; other apps may need to reconnect' : 'recommended',
+      },
+      {
+        value: 'remote',
+        label: 'Connect to an OneCLI on another host',
+        hint: 'point to a remote URL',
+      },
+    ];
+
+    const onecliChoice = ensureAnswer(
+      await brightSelect<OnecliChoice>({
+        message: existing
+          ? `Found an existing OneCLI at ${existing.apiHost}. What would you like to do?`
+          : 'How would you like to set up OneCLI?',
+        options: onecliOptions,
+      }),
+    ) as OnecliChoice;
+    setupLog.userInput('onecli_choice', onecliChoice);
+
+    let remoteUrl: string | undefined;
+    if (onecliChoice === 'remote') {
+      while (true) {
+        const answer = ensureAnswer(
+          await p.text({
+            message: 'OneCLI URL on the remote machine',
+            placeholder: 'http://192.168.1.10:10254',
+            validate: (v) => {
+              const t = (v ?? '').trim();
+              if (!t) return 'Required';
+              if (!/^https?:\/\//i.test(t)) return 'Must start with http:// or https://';
+              return undefined;
             },
-          ],
-        }),
-      ) as 'reuse' | 'fresh';
-      setupLog.userInput('onecli_choice', choice);
-      reuse = choice === 'reuse';
+          }),
+        );
+        remoteUrl = (answer as string).trim();
+        setupLog.userInput('onecli_remote_url', remoteUrl);
+
+        const s = p.spinner();
+        s.start('Checking remote OneCLI…');
+        const healthy = await pollHealth(remoteUrl, 5000);
+        if (healthy) {
+          s.stop('Remote OneCLI is reachable.');
+          break;
+        }
+        s.stop(`Couldn't reach OneCLI at ${remoteUrl}.`, 1);
+        p.log.warn(wrapForGutter('Make sure OneCLI is running and accessible from this machine, then try again.', 4));
+      }
     }
+
+    const stepArgs =
+      onecliChoice === 'reuse' ? ['--reuse'] : onecliChoice === 'remote' ? ['--remote-url', remoteUrl!] : [];
 
     const res = await runQuietStep(
       'onecli',
       {
-        running: reuse
-          ? 'Hooking up to your existing OneCLI…'
-          : "Setting up OneCLI, your agent's vault…",
+        running:
+          onecliChoice === 'reuse'
+            ? 'Hooking up to your existing OneCLI…'
+            : onecliChoice === 'remote'
+              ? `Connecting to remote OneCLI at ${remoteUrl}…`
+              : "Setting up OneCLI, your agent's vault…",
         done: 'OneCLI vault ready.',
       },
-      reuse ? ['--reuse'] : [],
+      stepArgs,
     );
     if (!res.ok) {
       const err = res.terminal?.fields.ERROR;
+      if (onecliChoice === 'remote') {
+        await fail(
+          'onecli',
+          `Couldn't connect to remote OneCLI (${err ?? 'unknown error'}).`,
+          'Check the URL and that OneCLI is running on the remote machine, then retry.',
+        );
+      }
       if (err === 'onecli_not_on_path_after_install') {
         await fail(
           'onecli',
@@ -217,19 +253,12 @@ async function main(): Promise<void> {
       done: 'NanoClaw is running.',
     });
     if (!res.ok) {
-      await fail(
-        'service',
-        "Couldn't start NanoClaw.",
-        'See logs/nanoclaw.error.log for details.',
-      );
+      await fail('service', "Couldn't start NanoClaw.", 'See logs/nanoclaw.error.log for details.');
     }
     if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true') {
-      p.log.warn(
-        "NanoClaw's permissions need a tweak before it can reach Docker.",
-      );
+      p.log.warn("NanoClaw's permissions need a tweak before it can reach Docker.");
       p.log.message(
-        '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock\n' +
-          `  systemctl --user restart ${getSystemdUnit()}`,
+        '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock\n' + `  systemctl --user restart ${getSystemdUnit()}`,
       );
     }
   }
@@ -294,7 +323,7 @@ async function main(): Promise<void> {
           msg:
             ping === 'socket_error'
               ? "NanoClaw service isn't listening on its CLI socket."
-              : "No reply from the assistant within 30 seconds.",
+              : 'No reply from the assistant within 30 seconds.',
           hint:
             ping === 'socket_error'
               ? 'Socket at data/cli.sock did not accept a connection.'
@@ -344,7 +373,7 @@ async function main(): Promise<void> {
     if (!res.ok) {
       const notes: string[] = [];
       if (res.terminal?.fields.CREDENTIALS !== 'configured') {
-        notes.push('• Your Claude account isn\'t connected. Re-run setup and try again.');
+        notes.push("• Your Claude account isn't connected. Re-run setup and try again.");
       }
       const service = res.terminal?.fields.SERVICE;
       if (service === 'running_other_checkout') {
@@ -370,7 +399,9 @@ async function main(): Promise<void> {
         }
       }
       if (!res.terminal?.fields.CONFIGURED_CHANNELS) {
-        notes.push('• Want to chat from your phone? Add a messaging app with `/add-telegram`, `/add-slack`, or `/add-discord`.');
+        notes.push(
+          '• Want to chat from your phone? Add a messaging app with `/add-telegram`, `/add-slack`, or `/add-discord`.',
+        );
       }
       if (notes.length > 0) {
         p.note(notes.join('\n'), "What's left");
@@ -404,9 +435,7 @@ async function main(): Promise<void> {
     ['Open Claude Code:', 'claude'],
   ];
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
-  const nextSteps = rows
-    .map(([l, c]) => `${k.cyan(l.padEnd(labelWidth))}  ${c}`)
-    .join('\n');
+  const nextSteps = rows.map(([l, c]) => `${k.cyan(l.padEnd(labelWidth))}  ${c}`).join('\n');
   p.note(nextSteps, 'Try these');
 
   // Always-on warning goes before the "check your DMs" directive so the
@@ -428,10 +457,7 @@ async function main(): Promise<void> {
     // that the welcome-message signal was too easy to miss. Use p.note so it
     // renders with a visible box, cyan-bold the directive line, and put it
     // as the last thing before outro.
-    p.note(
-      `${brandBold('→')} ${k.bold(`Check your ${dmTarget} — your assistant is saying hi.`)}`,
-      'Go say hi',
-    );
+    p.note(`${brandBold('→')} ${k.bold(`Check your ${dmTarget} — your assistant is saying hi.`)}`, 'Go say hi');
     p.outro(k.green("You're set."));
   } else {
     p.outro(k.green("You're ready! Chat with `pnpm run chat hi`."));
@@ -491,9 +517,7 @@ async function confirmAssistantResponds(): Promise<PingResult> {
     s.stop(`${k.bold(fitToWidth('Your assistant is ready.', suffix))}${k.dim(suffix)}`);
   } else {
     const msg =
-      result === 'socket_error'
-        ? "Couldn't reach the NanoClaw service."
-        : "Your assistant didn't reply in time.";
+      result === 'socket_error' ? "Couldn't reach the NanoClaw service." : "Your assistant didn't reply in time.";
     s.stop(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`, 1);
   }
   return result;
@@ -549,9 +573,7 @@ async function runFirstChat(): Promise<void> {
         message: first
           ? 'Try a quick hello — or press Enter to continue setup'
           : 'Another message? Press Enter to continue setup',
-        placeholder: first
-          ? 'e.g. "hi, what can you do?"'
-          : 'press Enter to continue',
+        placeholder: first ? 'e.g. "hi, what can you do?"' : 'press Enter to continue',
       }),
     );
     first = false;
@@ -567,11 +589,9 @@ function sendChatMessage(message: string): Promise<void> {
     // agent's reply reads as a clean block under the prompt. Splitting on
     // whitespace mirrors `pnpm run chat hello world` — chat.ts joins argv
     // with spaces on the far side.
-    const child = spawn(
-      'pnpm',
-      ['--silent', 'run', 'chat', ...message.split(/\s+/)],
-      { stdio: ['ignore', 'inherit', 'inherit'] },
-    );
+    const child = spawn('pnpm', ['--silent', 'run', 'chat', ...message.split(/\s+/)], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
     child.on('close', () => resolve());
     child.on('error', () => resolve());
   });
@@ -619,15 +639,11 @@ async function runAuthStep(): Promise<void> {
 }
 
 async function runSubscriptionAuth(): Promise<void> {
-  p.log.step("Opening the Claude sign-in flow…");
-  console.log(
-    k.dim('   (a browser will open for sign-in; this part is interactive)'),
-  );
+  p.log.step('Opening the Claude sign-in flow…');
+  console.log(k.dim('   (a browser will open for sign-in; this part is interactive)'));
   console.log();
   const start = Date.now();
-  const code = await runInheritScript('bash', [
-    'setup/register-claude-token.sh',
-  ]);
+  const code = await runInheritScript('bash', ['setup/register-claude-token.sh']);
   const durationMs = Date.now() - start;
   console.log();
   if (code !== 0) {
@@ -667,11 +683,16 @@ async function runPasteAuth(method: 'oauth' | 'api'): Promise<void> {
     'auth',
     'onecli',
     [
-      'secrets', 'create',
-      '--name', 'Anthropic',
-      '--type', 'anthropic',
-      '--value', token,
-      '--host-pattern', 'api.anthropic.com',
+      'secrets',
+      'create',
+      '--name',
+      'Anthropic',
+      '--type',
+      'anthropic',
+      '--value',
+      token,
+      '--host-pattern',
+      'api.anthropic.com',
     ],
     {
       running: `Saving your ${label} to your OneCLI vault…`,
@@ -710,10 +731,7 @@ async function runTimezoneStep(): Promise<void> {
   const fields = res.terminal?.fields ?? {};
   const resolvedTz = fields.RESOLVED_TZ;
   const needsInput = fields.NEEDS_USER_INPUT === 'true';
-  const isUtc =
-    resolvedTz === 'UTC' ||
-    resolvedTz === 'Etc/UTC' ||
-    resolvedTz === 'Universal';
+  const isUtc = resolvedTz === 'UTC' || resolvedTz === 'Etc/UTC' || resolvedTz === 'Universal';
 
   // Three branches:
   //   - no TZ detected: ask where they are (or leave as UTC)
@@ -735,8 +753,8 @@ async function runTimezoneStep(): Promise<void> {
   const message = needsInput
     ? "Your system didn't expose a timezone. Which one are you in?"
     : !isUtc
-      ? "Where are you, then?"
-      : "Your system reports UTC as the timezone. Is that right, or are you somewhere else?";
+      ? 'Where are you, then?'
+      : 'Your system reports UTC as the timezone. Is that right, or are you somewhere else?';
 
   // For the non-UTC "detected-but-wrong" branch we skip the select and jump
   // straight to the free-text prompt — the user already said "not that".
@@ -763,7 +781,7 @@ async function runTimezoneStep(): Promise<void> {
 
   const answer = ensureAnswer(
     await p.text({
-      message: "Where are you? (city, region, or IANA zone)",
+      message: 'Where are you? (city, region, or IANA zone)',
       placeholder: 'e.g. New York, London, Asia/Tokyo',
       validate: (v) => (v && v.trim() ? undefined : 'Required'),
     }),
@@ -959,9 +977,7 @@ function printIntro(): void {
   const wordmark = `${k.bold('Nano')}${brandBold('Claw')}`;
 
   if (isReexec) {
-    p.intro(
-      `${brandChip(' Welcome ')}  ${wordmark}  ${k.dim('· picking up where we left off')}`,
-    );
+    p.intro(`${brandChip(' Welcome ')}  ${wordmark}  ${k.dim('· picking up where we left off')}`);
     return;
   }
 
