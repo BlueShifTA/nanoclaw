@@ -13,7 +13,11 @@ let wikiSkillsSrc: string;
 let containerSkillsSrc: string;
 let skillsDst: string;
 
-function makeSkill(parent: string, name: string, files: Record<string, string>) {
+function makeSkill(
+  parent: string,
+  name: string,
+  files: Record<string, string>,
+) {
   const dir = path.join(parent, name);
   fs.mkdirSync(dir, { recursive: true });
   for (const [filename, content] of Object.entries(files)) {
@@ -26,7 +30,14 @@ beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-wiki-sync-'));
   wikiSkillsSrc = path.join(tmpRoot, 'obsidian-wiki', '.skills');
   containerSkillsSrc = path.join(tmpRoot, 'container', 'skills');
-  skillsDst = path.join(tmpRoot, 'data', 'sessions', 'group', '.claude', 'skills');
+  skillsDst = path.join(
+    tmpRoot,
+    'data',
+    'sessions',
+    'group',
+    '.claude',
+    'skills',
+  );
   fs.mkdirSync(skillsDst, { recursive: true });
 });
 
@@ -47,8 +58,12 @@ describe('syncWikiSkills', () => {
 
     expect(result.synced.sort()).toEqual(['wiki-ingest', 'wiki-query']);
     expect(result.skipped).toEqual([]);
-    expect(fs.existsSync(path.join(skillsDst, 'wiki-query', 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(skillsDst, 'wiki-ingest', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(skillsDst, 'wiki-query', 'SKILL.md'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(skillsDst, 'wiki-ingest', 'SKILL.md'))).toBe(
+      true,
+    );
   });
 
   it('does not overwrite a same-named skill from container/skills/', () => {
@@ -121,7 +136,10 @@ describe('syncWikiSkills', () => {
     fs.mkdirSync(wikiSkillsSrc, { recursive: true });
     // Dangling symlink (target does not exist) — mirrors the macOS-style
     // symlinks documented in container/agents/librarian.md.
-    fs.symlinkSync('/nonexistent/target', path.join(wikiSkillsSrc, 'broken-link'));
+    fs.symlinkSync(
+      '/nonexistent/target',
+      path.join(wikiSkillsSrc, 'broken-link'),
+    );
     makeSkill(wikiSkillsSrc, 'wiki-query', { 'SKILL.md': 'q' });
 
     const result = syncWikiSkills(wikiSkillsSrc, containerSkillsSrc, skillsDst);
@@ -158,7 +176,7 @@ describe('resolveWikiSkillsPath', () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it("reads OBSIDIAN_WIKI_REPO from ~/.obsidian-wiki/config (quoted value)", () => {
+  it('reads OBSIDIAN_WIKI_REPO from ~/.obsidian-wiki/config (quoted value)', () => {
     fs.mkdirSync(path.join(tmpHome, '.obsidian-wiki'), { recursive: true });
     fs.writeFileSync(
       path.join(tmpHome, '.obsidian-wiki', 'config'),
