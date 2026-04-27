@@ -25,6 +25,33 @@ When the user asks for code work — writing, reviewing, refactoring, or debuggi
 
 **Coding discipline:** for any non-trivial code task, invoke `/karpathy-guidelines` first, then plan with Serena + Context7 before editing.
 
+### Second-brain knowledge base
+
+You have a compiled Obsidian-format wiki of the user's knowledge — **ArmLabVault** — mounted at `/workspace/extra/vault`. It distills 130+ pages from his raw corpus across `concepts/`, `entities/`, `skills/`, `references/`, `synthesis/`, `journal/`, and `projects/`. Affinity tags (`affinity/p1`–`p4`, `altruistic`, `armlab-kb`) map pages to projects.
+
+The wiki framework that builds and maintains it lives at `/workspace/extra/wiki-framework` (the `obsidian-wiki` repo). Its skills are auto-installed into your `~/.claude/skills/`.
+
+**For READ queries — start with the librarian sub-agent (cheapest):**
+
+- `Task` tool → `subagent_type: "librarian"` — Haiku-powered, read-only, vault-aware. Use for *"what do I know about X"*, *"find pages tagged Y"*, *"what's the status of project Z"*, *"list orphan pages"*. It returns `[[wikilink]]` citations. Burning Haiku on lookups keeps your Opus context clean.
+
+**For semantic search directly (when you don't need a synthesised answer):**
+
+- `mcp__qmd__query` — hybrid search (BM25 + vector + reranker). Best default for natural-language questions.
+- `mcp__qmd__get` / `mcp__qmd__multi_get` — fetch document(s) by `qmd://wiki/<path>` or glob.
+- CLI equivalents (`qmd query "..." -c wiki --json -n 5`, `qmd vsearch`, `qmd search`, `qmd ls wiki`) work too.
+- Three collections are indexed: `wiki` (the compiled vault), `armlab` (raw ArmLab.io corpus), `altruistic` (project docs). Cross-collection search finds raw sources not yet distilled.
+
+**For WRITE / maintenance — wiki skills (slash commands available):**
+
+- `/wiki-query <question>` — open-ended Q&A against the vault (heavier than the librarian; use when you want the wiki framework's full retrieval protocol).
+- `/wiki-ingest` — distill new source documents into wiki pages (deduplicates, cross-links, maintains `.manifest.json`).
+- `/wiki-update` — sync the *current project's* learnings into the vault.
+- `/wiki-status` / `/wiki-lint` — health check, orphan detection, ingest delta.
+- `/cross-linker`, `/tag-taxonomy`, `/wiki-rebuild`, `/wiki-export`, `/wiki-capture`, `/wiki-research`, `/wiki-synthesize` — see `/workspace/extra/wiki-framework/AGENTS.md` for the full set.
+
+**Cheap-first principle:** prefer `librarian` for *"what do I know about X"*. Use `mcp__qmd__query` when you need raw hits. Reach for `/wiki-ingest` / `/wiki-update` when there's something *new* worth filing.
+
 ## Communication
 
 Your output is sent to the user or group.
