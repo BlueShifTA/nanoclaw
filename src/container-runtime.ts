@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import os from 'os';
 
 import { logger } from './logger.js';
@@ -17,6 +17,40 @@ export function hostGatewayArgs(): string[] {
     return ['--add-host=host.docker.internal:host-gateway'];
   }
   return [];
+}
+
+/**
+ * GPU passthrough args. Returns `['--gpus', 'all']` only when:
+ *   - NANOCLAW_GPU env is unset or != 'off' (set to 'off' to force-disable), AND
+ *   - the docker daemon advertises an `nvidia` runtime in `docker info`.
+ *
+ * Probed once and cached. Containers without GPU continue to work (qmd falls
+ * back to CPU). With GPU, qmd uses the bundled Vulkan ICD + libGLX_nvidia.so.0
+ * mounted in by NVIDIA Container Toolkit and offloads embedding/rerank to GPU.
+ */
+let _gpuArgs: string[] | undefined;
+export function gpuArgs(): string[] {
+  if (_gpuArgs !== undefined) return _gpuArgs;
+  if (process.env.NANOCLAW_GPU === 'off') {
+    _gpuArgs = [];
+    return _gpuArgs;
+  }
+  try {
+    const info = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['info', '--format', '{{json .Runtimes}}'],
+      { stdio: 'pipe', encoding: 'utf-8', timeout: 5000 },
+    );
+    if (/\bnvidia\b/.test(info)) {
+      logger.info('GPU passthrough enabled (nvidia runtime detected)');
+      _gpuArgs = ['--gpus', 'all'];
+      return _gpuArgs;
+    }
+  } catch {
+    /* fall through to no-gpu */
+  }
+  _gpuArgs = [];
+  return _gpuArgs;
 }
 
 /** Returns CLI args for a readonly bind mount. */

@@ -479,6 +479,7 @@ async function runQuery(
         'mcp__nanoclaw__*',
         'mcp__serena__*',
         'mcp__context7__*',
+        'mcp__qmd__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -506,6 +507,10 @@ async function runQuery(
         context7: {
           command: 'context7-mcp',
           args: [],
+        },
+        qmd: {
+          command: 'qmd',
+          args: ['mcp'],
         },
       },
       hooks: {

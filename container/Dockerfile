@@ -44,8 +44,41 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp /root/.local/bin/uvx /usr/local/bin/uvx \
     && rm -rf /root/.local/bin/uv /root/.local/bin/uvx
 
-# Install agent-browser, claude-code, codex CLI, codeburn, and context7-mcp globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex codeburn @upstash/context7-mcp
+# Vulkan loader + NVIDIA ICD. The actual NVIDIA driver libs are bind-mounted
+# from the host by `docker run --gpus all` (with NVIDIA Container Toolkit). We
+# only need the Vulkan loader (libvulkan1 / vulkan-tools) and an ICD file that
+# points at libGLX_nvidia.so.0. Mesa's CPU fallback (lavapipe) is also shipped
+# so containers without --gpus still work.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libvulkan1 \
+      vulkan-tools \
+      mesa-vulkan-drivers \
+    && mkdir -p /usr/share/vulkan/icd.d \
+    && cat > /usr/share/vulkan/icd.d/nvidia_icd.json <<'EOF'
+{
+    "file_format_version" : "1.0.0",
+    "ICD": {
+        "library_path": "libGLX_nvidia.so.0",
+        "api_version" : "1.3.289"
+    }
+}
+EOF
+RUN rm -rf /var/lib/apt/lists/*
+
+# Install agent-browser, claude-code, codex CLI, codeburn, context7-mcp, and qmd globally
+# qmd@2.1.0 is pinned to match the host install — avoid index/MCP schema drift.
+RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex codeburn @upstash/context7-mcp @tobilu/qmd@2.1.0
+
+# qmd persistence lives on the bind-mounted host dir at /workspace/extra/qmd-cache.
+# Both XDG paths point under that mount so the index AND the collection registry
+# survive container exits. (qmd writes index.sqlite + models to XDG_CACHE_HOME/qmd
+# and the collection registry to XDG_CONFIG_HOME/qmd/index.yml.)
+ENV XDG_CACHE_HOME=/workspace/extra/qmd-cache \
+    XDG_CONFIG_HOME=/workspace/extra/qmd-cache/config
+
+# When NVIDIA Container Toolkit injects driver libs (--gpus all), expose the
+# graphics capability so libGLX_nvidia.so.0 (Vulkan ICD target) is mounted.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
 # Install Serena MCP server (semantic code navigation) via uv tool
 # UV_TOOL_{DIR,BIN_DIR} makes the install accessible to the non-root `node` user.

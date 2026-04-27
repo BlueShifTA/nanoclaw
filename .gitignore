@@ -58,4 +58,8 @@ scratch/
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Claude Code runtime artifacts (lockfiles, per-machine settings)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
 agents-sdk-docs

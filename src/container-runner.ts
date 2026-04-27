@@ -22,6 +22,7 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
+  gpuArgs,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
@@ -35,6 +36,79 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/**
+ * Resolve the path to the obsidian-wiki repo's .skills directory.
+ * Reads `OBSIDIAN_WIKI_REPO` from `~/.obsidian-wiki/config` if present;
+ * otherwise falls back to `~/Projects/obsidian-wiki`. Returns the absolute
+ * path to `<repo>/.skills` regardless of whether it exists.
+ *
+ * Exported for testing.
+ */
+export function resolveWikiSkillsPath(): string {
+  const obsidianConfig = path.join(os.homedir(), '.obsidian-wiki', 'config');
+  let wikiRepo: string | undefined;
+  if (fs.existsSync(obsidianConfig)) {
+    const cfg = fs.readFileSync(obsidianConfig, 'utf-8');
+    const match = cfg.match(/^OBSIDIAN_WIKI_REPO="?([^"\n]+)"?/m);
+    if (match) wikiRepo = match[1];
+  }
+  wikiRepo = wikiRepo || path.join(os.homedir(), 'Projects', 'obsidian-wiki');
+  return path.join(wikiRepo, '.skills');
+}
+
+/**
+ * Sync obsidian-wiki skills into a group's .claude/skills/ directory.
+ * `containerSkillsSrc` (i.e. `container/skills/`) takes precedence —
+ * same-named entries from the wiki are skipped. Skips wiki entries that are
+ * not real directories (broken symlinks, stray files). No-op if `wikiSkillsSrc`
+ * doesn't exist (an install without obsidian-wiki configured).
+ *
+ * Returns the names actually synced + skipped, primarily for testing/logging.
+ *
+ * Exported for testing.
+ */
+export function syncWikiSkills(
+  wikiSkillsSrc: string,
+  containerSkillsSrc: string,
+  skillsDst: string,
+): { synced: string[]; skipped: string[] } {
+  if (!fs.existsSync(wikiSkillsSrc)) return { synced: [], skipped: [] };
+
+  const containerSkillNames = fs.existsSync(containerSkillsSrc)
+    ? new Set(
+        fs
+          .readdirSync(containerSkillsSrc)
+          .filter((n) =>
+            fs.statSync(path.join(containerSkillsSrc, n)).isDirectory(),
+          ),
+      )
+    : new Set<string>();
+
+  const synced: string[] = [];
+  const skipped: string[] = [];
+
+  for (const skillDir of fs.readdirSync(wikiSkillsSrc)) {
+    if (containerSkillNames.has(skillDir)) {
+      skipped.push(skillDir);
+      continue;
+    }
+    const srcDir = path.join(wikiSkillsSrc, skillDir);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(srcDir);
+    } catch {
+      // Broken symlink or unreadable entry — skip silently.
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const dstDir = path.join(skillsDst, skillDir);
+    fs.cpSync(srcDir, dstDir, { recursive: true });
+    synced.push(skillDir);
+  }
+
+  return { synced, skipped };
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -180,6 +254,30 @@ function buildVolumeMounts(
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+
+  // Also sync obsidian-wiki skills (wiki-ingest, wiki-query, etc.) into
+  // each group's .claude/skills/ so the agent can invoke them via slash
+  // commands. Skipped if obsidian-wiki isn't installed.
+  syncWikiSkills(resolveWikiSkillsPath(), skillsSrc, skillsDst);
+
+  // Sync sub-agents from container/agents/ into each group's .claude/agents/.
+  // Mirrors the skills-sync pattern. Each *.md file becomes an invokable
+  // sub-agent inside the container (e.g. librarian.md → @librarian).
+  const agentsSrc = path.join(process.cwd(), 'container', 'agents');
+  const agentsDst = path.join(groupSessionsDir, 'agents');
+  if (fs.existsSync(agentsSrc)) {
+    fs.mkdirSync(agentsDst, { recursive: true });
+    for (const entry of fs.readdirSync(agentsSrc)) {
+      const srcPath = path.join(agentsSrc, entry);
+      const stat = fs.statSync(srcPath);
+      const dstPath = path.join(agentsDst, entry);
+      if (stat.isDirectory()) {
+        fs.cpSync(srcPath, dstPath, { recursive: true });
+      } else if (entry.endsWith('.md')) {
+        fs.copyFileSync(srcPath, dstPath);
+      }
+    }
+  }
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -291,6 +389,10 @@ async function buildContainerArgs(
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
+
+  // GPU passthrough (auto-detected; set NANOCLAW_GPU=off to disable).
+  // Required for qmd's Vulkan offloading inside the container.
+  args.push(...gpuArgs());
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
