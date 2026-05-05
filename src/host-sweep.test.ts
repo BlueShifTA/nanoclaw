@@ -7,7 +7,12 @@ import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import { deleteOrphanProcessingClaims, getProcessingClaims } from './db/session-db.js';
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, resetStuckProcessingRows, decideStuckAction } from './host-sweep.js';
+import {
+  ABSOLUTE_CEILING_MS,
+  CLAIM_STUCK_MS,
+  _resetStuckProcessingRowsForTesting,
+  decideStuckAction,
+} from './host-sweep.js';
 import type { Session } from './types.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
@@ -248,7 +253,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     // Sanity: the orphan claim is what would trip claim-stuck.
     expect(getProcessingClaims(outDb)).toHaveLength(1);
 
-    resetStuckProcessingRows(inDb, outDb, fakeSession(), 'absolute-ceiling', outDb);
+    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
 
     // Regression assertion: orphan claim is gone — next sweep tick will see
     // an empty claims list and not kill the freshly respawned container.
@@ -280,7 +285,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       .run(claimedAt, future);
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
 
-    resetStuckProcessingRows(inDb, outDb, fakeSession(), 'claim-stuck', outDb);
+    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
 
     expect(getProcessingClaims(outDb)).toEqual([]);
     const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };

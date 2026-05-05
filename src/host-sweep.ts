@@ -250,23 +250,16 @@ function enforceRunningContainerSla(
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
-/**
- * Reset retries on inbound rows the container claimed but never acked, and
- * delete the orphan `processing_ack` rows so the next sweep tick doesn't
- * see them.
- *
- * Safe to call only when the container that owned `outbound.db` is dead —
- * production callers invoke this either in the `!alive` branch or right
- * after `killContainer`. Without that guarantee, the orphan-claim delete
- * would race the container's own writer.
- *
- * `writableOutDb` is the same handle outbound writes go through. When
- * omitted (typical production path) the function reopens `outbound.db`
- * read-write by session path for the delete and closes that handle on
- * exit. Callers that already hold a writable handle — including tests
- * using in-memory DBs — can pass it in to skip the reopen.
- */
-export function resetStuckProcessingRows(
+export function _resetStuckProcessingRowsForTesting(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  reason: string,
+): void {
+  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
+}
+
+function resetStuckProcessingRows(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
