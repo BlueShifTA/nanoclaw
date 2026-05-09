@@ -91,6 +91,31 @@ register({
   handler: async (args) => ({ echo: args }),
 });
 
+// Commands that return data shaped like real resources (for post-handler filtering tests)
+register({
+  name: 'groups-list-data',
+  description: 'returns mock group rows',
+  resource: 'groups',
+  access: 'open',
+  parseArgs: (raw) => raw,
+  handler: async () => [
+    { id: 'g1', name: 'my-group' },
+    { id: 'g2', name: 'other-group' },
+  ],
+});
+
+register({
+  name: 'sessions-get-data',
+  description: 'returns a mock session row',
+  resource: 'sessions',
+  access: 'open',
+  parseArgs: (raw) => raw,
+  handler: async (args) => ({
+    id: args.id,
+    agent_group_id: (args as Record<string, unknown>).belongs_to ?? 'g1',
+  }),
+});
+
 import { dispatch } from './dispatch.js';
 import type { CallerContext } from './frame.js';
 
@@ -155,6 +180,35 @@ describe('CLI scope enforcement', () => {
     const resp = await dispatch({ id: '1', command: 'groups-test', args: { id: 'g1' } }, agentCtx());
 
     expect(resp.ok).toBe(true);
+  });
+
+  it('group: blocks cli_scope escalation', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch(
+      { id: '1', command: 'groups-test', args: { cli_scope: 'global' } },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toContain('cli_scope');
+    }
+  });
+
+  it('group: blocks cli-scope escalation (hyphenated)', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch(
+      { id: '1', command: 'groups-test', args: { 'cli-scope': 'global' } },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+    }
   });
 
   it('group: blocks non-group resources', async () => {
@@ -300,5 +354,58 @@ describe('CLI scope enforcement', () => {
 
     expect(resp.ok).toBe(true);
     expect(mockGetContainerConfig).not.toHaveBeenCalled();
+  });
+
+  // --- Post-handler filtering ---
+
+  it('group: groups list filters out other groups', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch({ id: '1', command: 'groups-list-data', args: {} }, agentCtx());
+
+    expect(resp.ok).toBe(true);
+    if (resp.ok) {
+      const data = resp.data as Array<{ id: string }>;
+      expect(data).toHaveLength(1);
+      expect(data[0].id).toBe('g1');
+    }
+  });
+
+  it('group: sessions get rejects cross-group session', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch(
+      { id: '1', command: 'sessions-get-data', args: { id: 's-123', belongs_to: 'other-group' } },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toContain('different agent group');
+    }
+  });
+
+  it('group: sessions get allows own-group session', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch(
+      { id: '1', command: 'sessions-get-data', args: { id: 's-123', belongs_to: 'g1' } },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(true);
+  });
+
+  it('global: no post-handler filtering', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global' });
+
+    const resp = await dispatch({ id: '1', command: 'groups-list-data', args: {} }, agentCtx());
+
+    expect(resp.ok).toBe(true);
+    if (resp.ok) {
+      const data = resp.data as Array<{ id: string }>;
+      expect(data).toHaveLength(2); // both groups returned
+    }
   });
 });
