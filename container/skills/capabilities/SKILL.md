@@ -43,6 +43,7 @@ Read the allowed tools from your SDK configuration. You always have access to:
   - `mcp__nanoclaw__*` — messaging, tasks, group management
   - `mcp__serena__*` — semantic code navigation, symbol lookup, refactor assists
   - `mcp__context7__*` — up-to-date library/framework documentation lookup
+  - `mcp__qmd__*` — semantic + BM25 search over the user's local markdown collections (wiki, armlab, altruistic). Tools: `query`, `get`, `multi_get`, `status`. Prefer for any "what do I know about X" question.
 
 ### 3. MCP server tools
 

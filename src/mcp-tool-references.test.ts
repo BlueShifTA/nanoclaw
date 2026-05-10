@@ -51,6 +51,44 @@ function findAgentMarkdown(): string[] {
   return out;
 }
 
+describe('container.json mcpServers — agent must know they exist', () => {
+  // For every external MCP server declared in any group's container.json,
+  // the agent-facing capabilities skill should mention its `mcp__<name>__*`
+  // pattern. Otherwise the agent has tools it doesn't realise it has.
+  function findContainerJsons(): string[] {
+    if (!fs.existsSync(GROUPS_DIR)) return [];
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(GROUPS_DIR)) {
+      const cand = path.join(GROUPS_DIR, entry, 'container.json');
+      if (fs.existsSync(cand)) out.push(cand);
+    }
+    return out;
+  }
+
+  const capabilitiesSkill = path.join(REPO_ROOT, 'container/skills/capabilities/SKILL.md');
+  if (!fs.existsSync(capabilitiesSkill)) {
+    it.skip('capabilities SKILL.md not found — skipping', () => undefined);
+    return;
+  }
+  const skillText = fs.readFileSync(capabilitiesSkill, 'utf-8');
+
+  for (const cfgPath of findContainerJsons()) {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    const group = path.basename(path.dirname(cfgPath));
+    for (const name of Object.keys(cfg.mcpServers ?? {})) {
+      it(`${group}/container.json declares mcpServers."${name}" — capabilities skill mentions mcp__${name}__*`, () => {
+        const pattern = `mcp__${name}__`;
+        expect(
+          skillText.includes(pattern),
+          `Skill must mention ${pattern} so the agent discovers this tool family.`,
+        ).toBe(true);
+      });
+    }
+  }
+});
+
 describe('agent-prompt MCP tool references', () => {
   const registered = listRegisteredToolNames();
   const mdFiles = findAgentMarkdown();
