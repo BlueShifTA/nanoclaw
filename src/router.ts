@@ -19,6 +19,7 @@
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
+import { handleSessionCommand } from './session-commands.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -443,6 +444,11 @@ async function deliverToAgent(
         content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
       });
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
+      return;
+    }
+    if (gate.action === 'handle') {
+      await handleSessionCommand(gate.command, gate.args, { session, deliveryAddr });
+      log.info('Session command handled by host', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
     }
   }

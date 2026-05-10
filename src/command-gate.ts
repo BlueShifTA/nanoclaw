@@ -5,20 +5,28 @@
  * - Filtered commands: dropped silently (never reach the container)
  * - Admin commands: checked against user_roles; denied senders get a
  *   "Permission denied" response written directly to messages_out
+ * - Handled commands: admin-gated session commands the host runs
+ *   directly (ping, kill, reset, last, btw) — never reach the
+ *   container. Caller dispatches via session-commands.ts.
  * - Normal messages: pass through unchanged
  */
 import { getDb, hasTable } from './db/connection.js';
 
-export type GateResult = { action: 'pass' } | { action: 'filter' } | { action: 'deny'; command: string };
+export type GateResult =
+  | { action: 'pass' }
+  | { action: 'filter' }
+  | { action: 'deny'; command: string }
+  | { action: 'handle'; command: string; args: string };
 
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/remote-control']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files']);
+const HANDLED_COMMANDS = new Set(['/ping', '/reset', '/kill', '/last', '/btw']);
 
 /**
  * Classify a message and decide whether it should reach the container.
  * Returns 'pass' for normal messages and authorized admin commands,
  * 'filter' for silently-dropped commands, 'deny' for unauthorized
- * admin commands.
+ * admin/handled commands, 'handle' for host-side session commands.
  */
 export function gateCommand(content: string, userId: string | null, agentGroupId: string): GateResult {
   let text: string;
@@ -34,6 +42,14 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
   const command = text.split(/\s/)[0].toLowerCase();
 
   if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
+
+  if (HANDLED_COMMANDS.has(command)) {
+    if (!isAdmin(userId, agentGroupId)) {
+      return { action: 'deny', command };
+    }
+    const args = text.slice(command.length).trim();
+    return { action: 'handle', command, args };
+  }
 
   if (ADMIN_COMMANDS.has(command)) {
     if (isAdmin(userId, agentGroupId)) {
