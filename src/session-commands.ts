@@ -128,6 +128,28 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
     inDb.close();
   }
 
+  // Drift detection — v1 lines 685-699. When the container is running we
+  // look at the timestamp of the last outbound chat (proxy for v1's
+  // `lastAgentOutput.time`). If silentFor > DRIFT_THRESHOLD_MS emit the v1
+  // warning string; otherwise append "last output Xm ago" to the Agent: line.
+  const driftThresholdMs = parseInt(process.env.NANOCLAW_DRIFT_THRESHOLD_MS ?? '300000', 10); // 5 min
+  let silentForMs: number | null = null;
+  if (running) {
+    const outDb2 = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+    try {
+      const row = outDb2
+        .prepare("SELECT timestamp FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1")
+        .get() as { timestamp: string } | undefined;
+      if (row?.timestamp) {
+        const t = Date.parse(row.timestamp);
+        if (Number.isFinite(t)) silentForMs = Date.now() - t;
+      }
+    } finally {
+      outDb2.close();
+    }
+  }
+  const drifted = running && silentForMs !== null && silentForMs > driftThresholdMs;
+
   // Agent: state line — v1 has four mutually-exclusive states. We can
   // distinguish "no active container" vs "processing" via isContainerRunning,
   // and "processing N msgs" vs "container alive, no inbound being processed"
@@ -139,6 +161,9 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
     agentLine = `Agent: processing (${processingCount} message${processingCount === 1 ? '' : 's'} in flight)`;
   } else {
     agentLine = 'Agent: idle (container alive, waiting for input)';
+  }
+  if (running && !drifted && silentForMs !== null) {
+    agentLine += `, last output ${formatAge(silentForMs)} ago`;
   }
   lines.push(agentLine);
 
@@ -190,6 +215,15 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
     lines.push(`Continuation: ${conts.map((c) => c.key.replace('continuation:', '')).join(', ')}`);
   }
   lines.push(`Messages   : ${inCount} in, ${outCount} out`);
+
+  // v1 drift warning — separate line, visually distinct so the operator can't
+  // miss it. References both /kill and /reset as recovery paths.
+  if (drifted && silentForMs !== null) {
+    lines.push('');
+    lines.push(
+      `⚠️ Possible drift — silent for ${formatAge(silentForMs)}. Use /kill to force-stop or /reset to recover.`,
+    );
+  }
 
   writeReply(ctx, renderReport('**Session status**', lines));
 }
@@ -295,6 +329,20 @@ function readResetStats(ctx: SessionCommandContext): ResetStats {
 async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
   const journalPath = `/workspace/extra/armlab/journal/${new Date().toISOString().replace(/[:.]/g, '-')}-reset.md`;
 
+  // Capture max outbound seq BEFORE writing the request so the poll only
+  // sees NEW rows the agent wrote in response. Without this, a sentinel
+  // reply from a PREVIOUS /reset still sitting in outbound.db would match
+  // immediately and we'd surface a stale summary.
+  let startSeq = 0;
+  {
+    const seqDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+    try {
+      startSeq = (seqDb.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM messages_out').get() as { s: number }).s;
+    } finally {
+      seqDb.close();
+    }
+  }
+
   // Write the summary-request inbound. trigger=1 wakes the agent.
   writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
     id: `reset-req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -305,11 +353,13 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
     threadId: ctx.deliveryAddr.threadId,
     content: JSON.stringify({
       text:
-        '[SESSION RESET REQUEST] Before this session is cleared, please:\n' +
-        `1. Write a brief session journal entry to ${journalPath} covering: what we worked on, decisions made, unfinished work, important learnings. 5–10 bullets.\n` +
-        '2. If anything is index-worthy, append a one-line entry to /workspace/extra/armlab/.claude/memory/MEMORY.md.\n' +
-        `3. Reply with a SHORT human-readable summary (under 200 words) ending with the literal sentinel string on its own line:\n${RESET_SENTINEL}\n\n` +
-        'The continuation will be cleared after your reply. Do not start new work — just finish this summary.',
+        '[SESSION RESET REQUEST] This conversation is about to be cleared. Before that, do ALL of:\n\n' +
+        `1. Write a session journal at \`${journalPath}\` — 5–10 bullets covering: what we worked on, decisions made, files touched, unfinished work, important learnings. Be specific (file paths, decision points), not vague.\n\n` +
+        `2. ALWAYS append a one-line entry to \`/workspace/extra/armlab/.claude/memory/MEMORY.md\` pointing at the journal file you just wrote, with a SHORT (≤80 char) tag for what the session was about. Format:\n` +
+        `   \`- [${new Date().toISOString().slice(0, 10)} session](../journal/<filename>.md) — <tag>\`\n` +
+        `   This is not optional. Even an empty session gets one line ("no work, idle session") so the chronology is preserved.\n\n` +
+        `3. Reply with a SHORT human-readable summary (under 200 words) ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
+        'Do NOT start new work or run unrelated tools. Just write the two files and reply with the summary. The continuation will be cleared immediately after your reply.',
       reset_request: true,
     }),
     trigger: 1,
@@ -318,7 +368,7 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   await wakeContainer(ctx.session);
 
   const timeoutMs = parseInt(process.env.NANOCLAW_RESET_TIMEOUT_MS ?? '60000', 10);
-  const poll = await pollForResetSummary(ctx, timeoutMs);
+  const poll = await pollForResetSummary(ctx, startSeq, timeoutMs);
 
   // Always kill + clear after the wait, regardless of poll outcome.
   if (isContainerRunning(ctx.session.id)) {
@@ -414,6 +464,7 @@ async function doClear(ctx: SessionCommandContext, stats: ResetStats): Promise<v
 
 async function pollForResetSummary(
   ctx: SessionCommandContext,
+  startSeq: number,
   timeoutMs: number,
 ): Promise<{ found: true; summaryText: string } | { found: false }> {
   const intervalMs = Math.min(500, Math.max(20, Math.floor(timeoutMs / 10)));
@@ -422,13 +473,15 @@ async function pollForResetSummary(
     const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
     let row: { content: string } | undefined;
     try {
+      // seq > startSeq filters out any stale sentinel reply from a prior
+      // /reset that is still in outbound.db.
       row = outDb
         .prepare(
           `SELECT content FROM messages_out
-           WHERE kind = 'chat' AND content LIKE ?
-           ORDER BY seq DESC LIMIT 1`,
+           WHERE seq > ? AND kind = 'chat' AND content LIKE ?
+           ORDER BY seq ASC LIMIT 1`,
         )
-        .get(`%${RESET_SENTINEL}%`) as { content: string } | undefined;
+        .get(startSeq, `%${RESET_SENTINEL}%`) as { content: string } | undefined;
     } finally {
       outDb.close();
     }
