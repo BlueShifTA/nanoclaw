@@ -329,6 +329,14 @@ function buildMounts(
     mounts.push({ hostPath: codexAuth, containerPath: '/home/node/.codex/auth.json', readonly: true });
   }
 
+  // RTK config — mount the host's `~/.config/rtk/` read-only so the
+  // PreToolUse rtk hook inside the container picks up user customizations
+  // (filters.toml, config.toml). No-op when host doesn't use rtk.
+  const rtkConfig = path.join(os.homedir(), '.config', 'rtk');
+  if (fs.existsSync(rtkConfig)) {
+    mounts.push({ hostPath: rtkConfig, containerPath: '/home/node/.config/rtk', readonly: true });
+  }
+
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
