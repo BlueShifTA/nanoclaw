@@ -448,7 +448,11 @@ async function deliverToAgent(
     }
     if (gate.action === 'handle') {
       await handleSessionCommand(gate.command, gate.args, { session, deliveryAddr });
-      log.info('Session command handled by host', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
+      log.info('Session command handled by host', {
+        command: gate.command,
+        userId,
+        agentGroupId: agent.agent_group_id,
+      });
       return;
     }
   }

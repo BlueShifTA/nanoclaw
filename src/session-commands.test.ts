@@ -23,19 +23,9 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-import {
-  initTestDb,
-  closeDb,
-  runMigrations,
-  createAgentGroup,
-} from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { ensureSchema } from './db/session-db.js';
-import {
-  inboundDbPath,
-  openInboundDb,
-  openOutboundDb,
-  outboundDbPath,
-} from './session-manager.js';
+import { inboundDbPath, openInboundDb, openOutboundDb, outboundDbPath } from './session-manager.js';
 import { handleSessionCommand } from './session-commands.js';
 import type { Session } from './types.js';
 
@@ -81,9 +71,9 @@ function ensureSessionDbs(): void {
 function lastOutbound(): { kind: string; content: string } | undefined {
   const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
   try {
-    return db
-      .prepare('SELECT kind, content FROM messages_out ORDER BY seq DESC LIMIT 1')
-      .get() as { kind: string; content: string } | undefined;
+    return db.prepare('SELECT kind, content FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
+      | { kind: string; content: string }
+      | undefined;
   } finally {
     db.close();
   }
@@ -122,17 +112,49 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('/ping', () => {
-  it('writes "pong" to outbound when container is not running', async () => {
+describe('/ping — container status report', () => {
+  it('reports container state (idle when not running)', async () => {
     mockIsContainerRunning.mockReturnValue(false);
     await handleSessionCommand('/ping', '', ctx());
-    expect(outboundText()).toBe('pong');
+    const text = outboundText() ?? '';
+    expect(text).toContain('Container');
+    expect(text).toContain('idle');
   });
 
-  it('writes "pong (container running)" when container is alive', async () => {
+  it('reports container state (running when alive)', async () => {
     mockIsContainerRunning.mockReturnValue(true);
     await handleSessionCommand('/ping', '', ctx());
-    expect(outboundText()).toBe('pong (container running)');
+    const text = outboundText() ?? '';
+    expect(text).toContain('Container');
+    expect(text).toContain('running');
+  });
+
+  it('reports continuation status — "none" when no continuation row', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toContain('Continuation');
+    expect(text).toContain('none');
+  });
+
+  it('reports continuation status — provider names when continuations exist', async () => {
+    const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
+    db.prepare(
+      "INSERT INTO session_state (key, value, updated_at) VALUES ('continuation:claude', 'abc', datetime('now'))",
+    ).run();
+    db.close();
+
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toContain('claude');
+  });
+
+  it('reports message counts (in, out)', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/Messages.*\d+ in.*\d+ out/);
   });
 
   it('does not call killContainer', async () => {
@@ -145,9 +167,10 @@ describe('/ping', () => {
 describe('/reset', () => {
   function seedContinuation(provider: string, value: string): void {
     const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
-    db.prepare(
-      "INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-    ).run(`continuation:${provider}`, value);
+    db.prepare("INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, datetime('now'))").run(
+      `continuation:${provider}`,
+      value,
+    );
     db.close();
   }
 
@@ -155,9 +178,7 @@ describe('/reset', () => {
     const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
     try {
       return (
-        db
-          .prepare("SELECT COUNT(*) AS c FROM session_state WHERE key LIKE 'continuation:%'")
-          .get() as { c: number }
+        db.prepare("SELECT COUNT(*) AS c FROM session_state WHERE key LIKE 'continuation:%'").get() as { c: number }
       ).c;
     } finally {
       db.close();
@@ -173,7 +194,58 @@ describe('/reset', () => {
     await handleSessionCommand('/reset', '', ctx());
 
     expect(countContinuations()).toBe(0);
-    expect(outboundText()).toMatch(/Cleared 2 continuations/);
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/2 continuations/);
+    expect(text).toContain('claude');
+    expect(text).toContain('codex');
+  });
+
+  it('summarises the session before clearing — counts and time span', async () => {
+    // Seed a small history so the summary has something to count.
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', datetime('now'), ?, 'pending', 1)`,
+      )
+      .run('in-1', JSON.stringify({ text: 'first user msg' }));
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', datetime('now'), ?, 'pending', 1)`,
+      )
+      .run('in-2', JSON.stringify({ text: 'second user msg' }));
+    inDb.close();
+
+    const outDb = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, content)
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), datetime('now'), 'chat', 'discord:guild:123', 'discord', ?)`,
+      )
+      .run('out-1', JSON.stringify({ text: 'agent reply' }));
+    outDb.close();
+
+    seedContinuation('claude', 'session-abc');
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+
+    const text = outboundText() ?? '';
+    // Summary lines must mention message counts and an indication of
+    // what was cleared. The exact format is flexible but these signals
+    // must be present so the operator sees what the session held before
+    // it got wiped.
+    expect(text).toMatch(/2 in/);
+    expect(text).toMatch(/1 out/);
+    expect(text).toMatch(/Cleared/);
+  });
+
+  it('summary still produced for an empty session (no messages)', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/0 in/);
+    expect(text).toMatch(/0 out/);
   });
 
   it('kills container if one is running so it cannot rewrite a stale continuation', async () => {
@@ -185,7 +257,7 @@ describe('/reset', () => {
   it('replies cleanly even when there is nothing to clear', async () => {
     mockIsContainerRunning.mockReturnValue(false);
     await handleSessionCommand('/reset', '', ctx());
-    expect(outboundText()).toMatch(/No active continuation/);
+    expect(outboundText()).toMatch(/no active continuation/);
   });
 
   it('preserves non-continuation session_state keys', async () => {
@@ -276,9 +348,10 @@ describe('/btw', () => {
   function listInboundContents(): Array<{ trigger: number; content: string }> {
     const db = new Database(inboundDbPath(AGENT_GROUP, SESSION_ID));
     try {
-      return db
-        .prepare('SELECT trigger, content FROM messages_in ORDER BY seq ASC')
-        .all() as Array<{ trigger: number; content: string }>;
+      return db.prepare('SELECT trigger, content FROM messages_in ORDER BY seq ASC').all() as Array<{
+        trigger: number;
+        content: string;
+      }>;
     } finally {
       db.close();
     }

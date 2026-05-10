@@ -6,8 +6,14 @@
  *
  * Dispatched from router.ts when gateCommand returns `action: 'handle'`.
  */
+import fs from 'fs';
+import path from 'path';
+
+import { DATA_DIR } from './config.js';
 import { killContainer, isContainerRunning } from './container-runner.js';
 import { log } from './log.js';
+
+const SESSIONS_ROOT = path.join(DATA_DIR, 'v2-sessions');
 import {
   openInboundDb,
   openOutboundDb,
@@ -34,11 +40,7 @@ export function isSessionCommand(command: string): boolean {
   return command in HANDLERS;
 }
 
-export async function handleSessionCommand(
-  command: string,
-  args: string,
-  ctx: SessionCommandContext,
-): Promise<void> {
+export async function handleSessionCommand(command: string, args: string, ctx: SessionCommandContext): Promise<void> {
   const handler = HANDLERS[command];
   if (!handler) {
     log.warn('Unknown session command dispatched', { command });
@@ -68,33 +70,124 @@ function writeReply(ctx: SessionCommandContext, text: string): void {
 }
 
 async function handlePing(_args: string, ctx: SessionCommandContext): Promise<void> {
+  const lines: string[] = ['*Session status*'];
+
   const running = isContainerRunning(ctx.session.id);
-  writeReply(ctx, running ? 'pong (container running)' : 'pong');
+  lines.push(`Container : ${running ? 'running' : 'idle'}`);
+
+  if (ctx.session.last_active) {
+    lines.push(`Last active: ${ctx.session.last_active}`);
+  } else {
+    lines.push('Last active: (never)');
+  }
+
+  // Heartbeat freshness — file-mtime read, fast.
+  const hbPath = path.join(SESSIONS_ROOT, ctx.session.agent_group_id, ctx.session.id, '.heartbeat');
+  try {
+    const st = fs.statSync(hbPath);
+    const ageMs = Date.now() - st.mtimeMs;
+    lines.push(`Heartbeat  : ${formatAge(ageMs)} ago`);
+  } catch {
+    lines.push('Heartbeat  : (none)');
+  }
+
+  // Continuation pointer per provider.
+  const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+  let conts: Array<{ key: string }> = [];
+  let outCount = 0;
+  let inCount = 0;
+  try {
+    conts = outDb
+      .prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key")
+      .all() as Array<{ key: string }>;
+    outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+  } finally {
+    outDb.close();
+  }
+  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
+  try {
+    inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
+  } finally {
+    inDb.close();
+  }
+
+  if (conts.length === 0) {
+    lines.push('Continuation: none (next message starts fresh)');
+  } else {
+    lines.push(`Continuation: ${conts.map((c) => c.key.replace('continuation:', '')).join(', ')}`);
+  }
+  lines.push(`Messages   : ${inCount} in, ${outCount} out`);
+
+  writeReply(ctx, lines.join('\n'));
+}
+
+function formatAge(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  return `${h}h`;
 }
 
 async function handleReset(_args: string, ctx: SessionCommandContext): Promise<void> {
-  // Clear every provider's continuation row so the next message starts a
-  // fresh conversation. Kill any live container so it can't write a stale
-  // continuation back after we cleared it.
+  // Summarise what's in the session BEFORE clearing — counts + time span
+  // — so the operator sees what got wiped. Then kill any live container
+  // so it can't write a stale continuation back, then delete the
+  // continuation rows.
+  let inCount = 0;
+  let outCount = 0;
+  let firstTs: string | undefined;
+  let lastTs: string | undefined;
+  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
+  try {
+    inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
+    const span = inDb
+      .prepare(
+        "SELECT MIN(timestamp) AS first, MAX(timestamp) AS last FROM messages_in WHERE kind IN ('chat', 'chat-sdk')",
+      )
+      .get() as { first: string | null; last: string | null } | undefined;
+    firstTs = span?.first ?? undefined;
+    lastTs = span?.last ?? undefined;
+  } finally {
+    inDb.close();
+  }
+
   if (isContainerRunning(ctx.session.id)) {
     killContainer(ctx.session.id, 'admin /reset');
   }
-  const db = openOutboundDbRw(ctx.session.agent_group_id, ctx.session.id);
-  let changes = 0;
+
+  const outDb = openOutboundDbRw(ctx.session.agent_group_id, ctx.session.id);
+  let cleared = 0;
+  let providers: string[] = [];
   try {
-    const result = db
-      .prepare("DELETE FROM session_state WHERE key LIKE 'continuation:%'")
-      .run();
-    changes = result.changes;
+    outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+    providers = (
+      outDb
+        .prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key")
+        .all() as Array<{ key: string }>
+    ).map((r) => r.key.replace('continuation:', ''));
+    const result = outDb.prepare("DELETE FROM session_state WHERE key LIKE 'continuation:%'").run();
+    cleared = result.changes;
   } finally {
-    db.close();
+    outDb.close();
   }
-  writeReply(
-    ctx,
-    changes > 0
-      ? `Session reset. Cleared ${changes} continuation${changes === 1 ? '' : 's'} — next message starts fresh.`
-      : 'Session reset. No active continuation to clear — next message starts fresh.',
-  );
+
+  const lines: string[] = ['*Session reset*'];
+  lines.push(`Messages : ${inCount} in, ${outCount} out`);
+  if (firstTs && lastTs && firstTs !== lastTs) {
+    lines.push(`Span     : ${firstTs} → ${lastTs}`);
+  } else if (firstTs) {
+    lines.push(`Span     : ${firstTs}`);
+  }
+  if (cleared > 0) {
+    lines.push(`Cleared  : ${cleared} continuation${cleared === 1 ? '' : 's'} (${providers.join(', ')})`);
+  } else {
+    lines.push('Cleared  : no active continuation');
+  }
+  lines.push('Next message starts a fresh conversation.');
+  writeReply(ctx, lines.join('\n'));
 }
 
 async function handleKill(_args: string, ctx: SessionCommandContext): Promise<void> {
@@ -127,9 +220,7 @@ async function handleLast(_args: string, ctx: SessionCommandContext): Promise<vo
   const outboundDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
   try {
     lastOutbound = outboundDb
-      .prepare(
-        "SELECT timestamp, content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1",
-      )
+      .prepare("SELECT timestamp, content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1")
       .get() as { timestamp: string; content: string } | undefined;
   } finally {
     outboundDb.close();
