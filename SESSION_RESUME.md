@@ -34,16 +34,18 @@ alias resume-nanoclaw='claude --resume 178f85b3-77ba-446a-baf7-96816c6077d3'
 - **F5 Serena + Context7 MCP** (2026-05-10, commit 972cf48) — Dockerfile installs `serena` via uv tool (UV_TOOL_BIN_DIR=/usr/local/bin) and `context7-mcp@2.2.4` via pnpm. Smoke-tested in `nanoclaw-agent-v2-8d820e2c:latest`. Per-group registration is via container.json `mcpServers`.
 - **F6 QMD container MCP** (2026-05-10) — Dockerfile installs `@tobilu/qmd@2.1.0` via pnpm (better-sqlite3 added to build-script allowlist). Symlinks `/home/armywander/{Projects,.cache,.config}` → `/workspace/extra/{vault,armlab,altruistic,qmd-cache,qmd-config}` so the host index's stored paths resolve inside the container; `/home/node/.{cache,config}/qmd` symlinked through to the same. Host `~/.cache/qmd` + `~/.config/qmd` mounted RO via container.json. MCP stdio handshake verified: `query`, `get`, `multi_get`, `status` tools exposed; 888 docs (wiki/armlab/altruistic). Path stub bakes the `armywander` username — fork-specific.
 
-## What's pending — F7–F8
+## What's pending — F7
+
+F8 (send_media MCP tool) is **superseded** — v2 ships `mcp__nanoclaw__send_file` (`container/agent-runner/src/mcp-tools/core.ts:135`) with outbox staging (`src/delivery.ts:351`) and chat-sdk-bridge file upload (`src/channels/chat-sdk-bridge.ts:492-505`). Channel-agnostic and multi-destination; covers all v1 send_media behaviour except the explicit 25MB pre-check (deferred to adapter). No direct unit test for send_file — only indirect coverage via outbox/delivery integration. Optional follow-ups: add 25MB pre-check + dedicated unit test, rename `mcp__nanoclaw__send_media` mention in `groups/discord_main/CLAUDE.local.md`, OR add a `send_media` alias in core.ts.
+
 
 Each is a separate task-run, sequential, with TDD where it makes sense. Pick up by reading `docs/v1-fork-reference.md` (full index) and starting the next one.
 
 | # | Feature | Touches | Est | Notes for next session |
 |---|---------|---------|-----|------------------------|
 | F7 | Session commands `/ping /kill /reset /last /btw` + drift detection | host-only: `src/command-gate.ts` + new handlers + tests | 6h | TDD-friendly. v2 only has `/compact` today. |
-| F8 | `send_media` MCP tool (Discord media) | DB schema + `messages_out` + delivery + adapter + new MCP tool | 8h | Heaviest; cross-cutting. |
 
-Total remaining ≈ 14h.
+Total remaining ≈ 6h.
 
 ## Key state references
 

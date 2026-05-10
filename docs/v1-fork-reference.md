@@ -27,9 +27,9 @@ For each commit, this doc records:
 | 9 | c30b248 | fix: concurrency group for fork-sync | **superseded** | — |
 | 10 | 853737f | docs: token count badge | **drop** (cosmetic) | — |
 | 11 | ba9353c | chore: bump to v1.2.14 | **drop** (v1-only) | — |
-| 12 | 7aa2b5e | feat: media attachment support for Discord | **port** | **HIGH** — explicit user ask |
+| 12 | 7aa2b5e | feat: media attachment support for Discord | **superseded** — v2 ships `mcp__nanoclaw__send_file` (channel-agnostic, multi-destination) | — |
 | 13 | ab20c61 | feat: session commands `/ping /kill /reset /compact /last /btw` + drift detection | **port** (v2 only has `/compact`) | **HIGH** — explicit user ask |
-| 14 | 296ad61 | feat: wire media + session commands into orchestrator | **port** (depends on 12+13) | **HIGH** |
+| 14 | 296ad61 | feat: wire media + session commands into orchestrator | **partial** — media half superseded by send_file; session-command half still F7 | **HIGH** |
 | 15 | 872412a | chore: gitignore CLAUDE.local.md | **superseded** (v2 native) | — |
 | 16 | 9576e62 | style: prettier on discord+ipc | **drop** (cosmetic) | — |
 | 17 | cdf2b37 | feat: load CLAUDE.local.md into agent system prompt | **superseded** (v2 native — see `Migrated groups to CLAUDE.local.md model` in startup log) | — |
