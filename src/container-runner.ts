@@ -5,6 +5,7 @@
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
@@ -320,6 +321,14 @@ function buildMounts(
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
   }
 
+  // Codex CLI auth — mount the host's `~/.codex/auth.json` read-only so the
+  // codex CLI inside the container picks up the host's `codex login` session.
+  // No-op when the host hasn't run `codex login`.
+  const codexAuth = path.join(os.homedir(), '.codex', 'auth.json');
+  if (fs.existsSync(codexAuth)) {
+    mounts.push({ hostPath: codexAuth, containerPath: '/home/node/.codex/auth.json', readonly: true });
+  }
+
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
@@ -439,11 +448,24 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Default NO_PROXY so the OneCLI HTTPS_PROXY doesn't intercept calls to
+  // host-side services (Command Center on host.docker.internal, localhost
+  // probes from skills, etc.). Providers can override via env contribution.
+  // GH_TOKEN is a dummy that lets gh CLI pass its own auth check; OneCLI's
+  // HTTPS proxy MITMs api.github.com and substitutes the real PAT from the
+  // vault — keeping the real token out of the container env.
+  const containerEnv: Record<string, string> = {
+    NO_PROXY: 'host.docker.internal,localhost,127.0.0.1',
+    GH_TOKEN: 'gho_dummy',
+  };
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
+    Object.assign(containerEnv, providerContribution.env);
+  }
+
+  for (const [key, value] of Object.entries(containerEnv)) {
+    args.push('-e', `${key}=${value}`);
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
