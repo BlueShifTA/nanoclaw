@@ -10,7 +10,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from './config.js';
-import { killContainer, isContainerRunning } from './container-runner.js';
+import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { log } from './log.js';
 
@@ -189,20 +189,48 @@ function formatAge(ms: number): string {
   return `${h}h`;
 }
 
-async function handleReset(_args: string, ctx: SessionCommandContext): Promise<void> {
-  // Summarise what's in the session BEFORE clearing — counts + time span
-  // — and persist a markdown snapshot to the group's .session-history/
-  // folder so the agent can read it back on a future session. Then kill
-  // any live container so it can't write a stale continuation back, then
-  // delete the continuation rows.
+/**
+ * Sentinel the agent must echo so the host knows the summary turn finished.
+ * Fixed string (vs per-request UUID) keeps the protocol simple: the agent
+ * can be taught it once in the prompt. False positives in normal chat are
+ * extremely unlikely given the token's specificity.
+ */
+const RESET_SENTINEL = '__SESSION_RESET_SUMMARY_COMPLETE__';
+
+async function handleReset(args: string, ctx: SessionCommandContext): Promise<void> {
+  const trimmed = args.trim();
+  const quick = /^(--quick|--no-summary|--force|quick|force)$/i.test(trimmed);
+
+  // Gather pre-clear stats — both for the snapshot file and the reply.
+  const stats = readResetStats(ctx);
+
+  // Empty sessions: nothing to summarise — short-circuit to quick clear so
+  // the user isn't waiting 60s for an agent turn that has no content.
+  if (quick || stats.inCount === 0) {
+    return doClear(ctx, stats);
+  }
+
+  // Agent-driven flow: write a summary-request inbound, wake the container,
+  // poll outbound for the sentinel, then clear.
+  await runAgentDrivenReset(ctx, stats);
+}
+
+interface ResetStats {
+  inCount: number;
+  outCount: number;
+  firstTs?: string;
+  lastTs?: string;
+  recentInbound: Array<{ timestamp: string; content: string }>;
+  recentOutbound: Array<{ timestamp: string; content: string }>;
+  providers: string[];
+}
+
+function readResetStats(ctx: SessionCommandContext): ResetStats {
+  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
   let inCount = 0;
-  let outCount = 0;
   let firstTs: string | undefined;
   let lastTs: string | undefined;
   let recentInbound: Array<{ timestamp: string; content: string }> = [];
-  let recentOutbound: Array<{ timestamp: string; content: string }> = [];
-
-  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
   try {
     inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
     const span = inDb
@@ -221,12 +249,9 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
     inDb.close();
   }
 
-  if (isContainerRunning(ctx.session.id)) {
-    killContainer(ctx.session.id, 'admin /reset');
-  }
-
-  const outDb = openOutboundDbRw(ctx.session.agent_group_id, ctx.session.id);
-  let cleared = 0;
+  const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+  let outCount = 0;
+  let recentOutbound: Array<{ timestamp: string; content: string }> = [];
   let providers: string[] = [];
   try {
     outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
@@ -238,36 +263,132 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
         key: string;
       }>
     ).map((r) => r.key.replace('continuation:', ''));
-    const result = outDb.prepare("DELETE FROM session_state WHERE key LIKE 'continuation:%'").run();
-    cleared = result.changes;
   } finally {
     outDb.close();
   }
+  return {
+    inCount,
+    outCount,
+    firstTs,
+    lastTs,
+    recentInbound: recentInbound.slice().reverse(),
+    recentOutbound: recentOutbound.slice().reverse(),
+    providers,
+  };
+}
 
-  // Persist a snapshot file ONLY if there was meaningful content (avoid
-  // littering with empty resets). Skip when both in/out are zero.
+async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
+  const journalPath = `/workspace/extra/armlab/journal/${new Date()
+    .toISOString()
+    .replace(/[:.]/g, '-')}-reset.md`;
+
+  // Write the summary-request inbound. trigger=1 wakes the agent.
+  writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
+    id: `reset-req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: ctx.deliveryAddr.platformId,
+    channelType: ctx.deliveryAddr.channelType,
+    threadId: ctx.deliveryAddr.threadId,
+    content: JSON.stringify({
+      text:
+        '[SESSION RESET REQUEST] Before this session is cleared, please:\n' +
+        `1. Write a brief session journal entry to ${journalPath} covering: what we worked on, decisions made, unfinished work, important learnings. 5–10 bullets.\n` +
+        '2. If anything is index-worthy, append a one-line entry to /workspace/extra/armlab/.claude/memory/MEMORY.md.\n' +
+        `3. Reply with a SHORT human-readable summary (under 200 words) ending with the literal sentinel string on its own line:\n${RESET_SENTINEL}\n\n` +
+        'The continuation will be cleared after your reply. Do not start new work — just finish this summary.',
+      reset_request: true,
+    }),
+    trigger: 1,
+  });
+
+  await wakeContainer(ctx.session);
+
+  const timeoutMs = parseInt(process.env.NANOCLAW_RESET_TIMEOUT_MS ?? '60000', 10);
+  const poll = await pollForResetSummary(ctx, timeoutMs);
+
+  // Always kill + clear after the wait, regardless of poll outcome.
+  if (isContainerRunning(ctx.session.id)) {
+    killContainer(ctx.session.id, 'admin /reset (post-summary)');
+  }
+  const cleared = clearContinuations(ctx);
+
+  // Snapshot file with the agent's summary appended (if we got one).
   let snapshotRel: string | undefined;
-  if (inCount > 0 || outCount > 0) {
+  if (stats.inCount > 0 || stats.outCount > 0) {
     snapshotRel = writeSessionSnapshot(ctx, {
-      inCount,
-      outCount,
-      firstTs,
-      lastTs,
-      providers,
-      recentInbound: recentInbound.slice().reverse(),
-      recentOutbound: recentOutbound.slice().reverse(),
+      inCount: stats.inCount,
+      outCount: stats.outCount,
+      firstTs: stats.firstTs,
+      lastTs: stats.lastTs,
+      providers: stats.providers,
+      recentInbound: stats.recentInbound,
+      recentOutbound: stats.recentOutbound,
+      agentSummary: poll.found ? poll.summaryText : undefined,
+    });
+  }
+
+  // Compose final user-facing reply.
+  const lines: string[] = [];
+  lines.push(`Messages : ${stats.inCount} in, ${stats.outCount} out`);
+  if (stats.firstTs && stats.lastTs && stats.firstTs !== stats.lastTs) {
+    lines.push(`Span     : ${stats.firstTs} → ${stats.lastTs}`);
+  }
+  if (cleared > 0) {
+    lines.push(`Cleared  : ${cleared} continuation${cleared === 1 ? '' : 's'} (${stats.providers.join(', ')})`);
+  } else {
+    lines.push('Cleared  : no active continuation');
+  }
+  if (snapshotRel) {
+    lines.push(`Snapshot : ${snapshotRel}`);
+  }
+  if (poll.found) {
+    lines.push('');
+    lines.push('Agent summary:');
+    for (const l of poll.summaryText.split('\n')) lines.push(l);
+  } else {
+    lines.push('Summary  : timed out waiting for agent — cleared anyway.');
+  }
+  writeReply(ctx, renderReport('**Session reset**', lines));
+}
+
+function clearContinuations(ctx: SessionCommandContext): number {
+  const outDb = openOutboundDbRw(ctx.session.agent_group_id, ctx.session.id);
+  try {
+    return outDb.prepare("DELETE FROM session_state WHERE key LIKE 'continuation:%'").run().changes;
+  } finally {
+    outDb.close();
+  }
+}
+
+async function doClear(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
+  if (isContainerRunning(ctx.session.id)) {
+    killContainer(ctx.session.id, 'admin /reset --quick');
+  }
+  const cleared = clearContinuations(ctx);
+
+  let snapshotRel: string | undefined;
+  if (stats.inCount > 0 || stats.outCount > 0) {
+    snapshotRel = writeSessionSnapshot(ctx, {
+      inCount: stats.inCount,
+      outCount: stats.outCount,
+      firstTs: stats.firstTs,
+      lastTs: stats.lastTs,
+      providers: stats.providers,
+      recentInbound: stats.recentInbound,
+      recentOutbound: stats.recentOutbound,
     });
   }
 
   const lines: string[] = [];
-  lines.push(`Messages : ${inCount} in, ${outCount} out`);
-  if (firstTs && lastTs && firstTs !== lastTs) {
-    lines.push(`Span     : ${firstTs} → ${lastTs}`);
-  } else if (firstTs) {
-    lines.push(`Span     : ${firstTs}`);
+  lines.push(`Messages : ${stats.inCount} in, ${stats.outCount} out`);
+  if (stats.firstTs && stats.lastTs && stats.firstTs !== stats.lastTs) {
+    lines.push(`Span     : ${stats.firstTs} → ${stats.lastTs}`);
+  } else if (stats.firstTs) {
+    lines.push(`Span     : ${stats.firstTs}`);
   }
   if (cleared > 0) {
-    lines.push(`Cleared  : ${cleared} continuation${cleared === 1 ? '' : 's'} (${providers.join(', ')})`);
+    lines.push(`Cleared  : ${cleared} continuation${cleared === 1 ? '' : 's'} (${stats.providers.join(', ')})`);
   } else {
     lines.push('Cleared  : no active continuation');
   }
@@ -275,7 +396,36 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
     lines.push(`Snapshot : ${snapshotRel}`);
   }
   lines.push('Next message starts a fresh conversation.');
-  writeReply(ctx, renderReport('**Session reset**', lines));
+  writeReply(ctx, renderReport('**Session reset (quick)**', lines));
+}
+
+async function pollForResetSummary(
+  ctx: SessionCommandContext,
+  timeoutMs: number,
+): Promise<{ found: true; summaryText: string } | { found: false }> {
+  const intervalMs = Math.min(500, Math.max(20, Math.floor(timeoutMs / 10)));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+    let row: { content: string } | undefined;
+    try {
+      row = outDb
+        .prepare(
+          `SELECT content FROM messages_out
+           WHERE kind = 'chat' AND content LIKE ?
+           ORDER BY seq DESC LIMIT 1`,
+        )
+        .get(`%${RESET_SENTINEL}%`) as { content: string } | undefined;
+    } finally {
+      outDb.close();
+    }
+    if (row) {
+      const text = extractText(row.content).replace(RESET_SENTINEL, '').trim();
+      return { found: true, summaryText: text };
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { found: false };
 }
 
 interface SnapshotPayload {
@@ -286,6 +436,7 @@ interface SnapshotPayload {
   providers: string[];
   recentInbound: Array<{ timestamp: string; content: string }>;
   recentOutbound: Array<{ timestamp: string; content: string }>;
+  agentSummary?: string;
 }
 
 function writeSessionSnapshot(ctx: SessionCommandContext, p: SnapshotPayload): string | undefined {
@@ -318,6 +469,12 @@ function writeSessionSnapshot(ctx: SessionCommandContext, p: SnapshotPayload): s
   md.push(`- Messages  : ${p.inCount} in, ${p.outCount} out`);
   if (p.providers.length > 0) {
     md.push(`- Cleared   : continuation for ${p.providers.join(', ')}`);
+  }
+  if (p.agentSummary) {
+    md.push('');
+    md.push('## Agent summary');
+    md.push('');
+    md.push(p.agentSummary);
   }
   md.push('');
   md.push('## Recent inbound (oldest → newest, up to 5)');
