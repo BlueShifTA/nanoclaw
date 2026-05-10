@@ -25,6 +25,7 @@ ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 ARG CODEX_VERSION=0.128.0
 ARG CONTEXT7_VERSION=2.2.4
+ARG QMD_VERSION=2.1.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -91,9 +92,9 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     rm -rf /root/.bun
 
 # ---- uv (Python package manager) --------------------------------------------
-# Pinned. Used by F5 (Serena via `uv tool install`), F6 (QMD Python deps),
-# and any user Python tooling. Installer drops binaries under /root/.local/bin;
-# move to /usr/local/bin so the non-root `node` user can execute them.
+# Pinned. Used by F5 (Serena via `uv tool install`) and any user Python
+# tooling. Installer drops binaries under /root/.local/bin; move to
+# /usr/local/bin so the non-root `node` user can execute them.
 ARG UV_VERSION=0.11.11
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     install -m 0755 /root/.local/bin/uv /usr/local/bin/uv && \
@@ -146,6 +147,20 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@upstash/context7-mcp@${CONTEXT7_VERSION}"
 
+# ---- QMD (Quick Markdown Search, F6) -----------------------------------------
+# stdio MCP server. Container reads the host's pre-built index via a mount
+# at /workspace/extra/qmd-cache, redirected through a symlink at the default
+# cache location ($HOME/.cache/qmd). The mount is RO — re-indexing happens
+# on the host (`qmd update`); container queries don't write.
+#
+# QMD pulls in `better-sqlite3` (native sqlite binding). Its postinstall
+# fetches the prebuilt .node binary, so it must be on pnpm's build allowlist
+# or `qmd status`/`qmd search` crash with "Could not locate the bindings
+# file." Human-approved exception (F6).
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    echo "only-built-dependencies[]=better-sqlite3" >> /root/.npmrc && \
+    pnpm install -g "@tobilu/qmd@${QMD_VERSION}"
+
 # ---- Serena MCP (semantic code navigation) -----------------------------------
 # Installed via uv tool with UV_TOOL_BIN_DIR=/usr/local/bin so the binary lands
 # where the non-root `node` user can call it. Prerelease allowed (serena is
@@ -170,6 +185,28 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /workspace/group /workspace/extra && \
     chown -R node:node /workspace && \
     chmod 777 /home/node
+
+# QMD index portability — the host-built index stores collection paths from
+# the host (e.g. /home/armywander/Projects/ArmLabVault). qmd's MCP startup
+# refuses to run if the on-disk config hash differs from what's in the DB
+# (it would otherwise try to upsert into a read-only mount). To keep both
+# matching we mount the host config dir as-is and provide stub symlinks at
+# the original host paths that redirect to the container mounts.
+#
+# Host layout assumed: /home/armywander/Projects/{ArmLabVault,ArmLab.io,
+# Altruistic} + /home/armywander/.{cache,config}/qmd. The "armywander"
+# username matches this personal fork; rename or override per user if needed.
+RUN mkdir -p /home/armywander/Projects /home/armywander/.cache /home/armywander/.config && \
+    ln -s /workspace/extra/qmd-cache /home/armywander/.cache/qmd && \
+    ln -s /workspace/extra/qmd-config /home/armywander/.config/qmd && \
+    ln -s /workspace/extra/vault /home/armywander/Projects/ArmLabVault && \
+    ln -s /workspace/extra/armlab /home/armywander/Projects/ArmLab.io && \
+    ln -s /workspace/extra/altruistic /home/armywander/Projects/Altruistic && \
+    chown -R node:node /home/armywander && \
+    mkdir -p /home/node/.cache /home/node/.config && \
+    ln -s /home/armywander/.cache/qmd /home/node/.cache/qmd && \
+    ln -s /home/armywander/.config/qmd /home/node/.config/qmd && \
+    chown -h node:node /home/node/.cache/qmd /home/node/.config/qmd
 
 USER node
 WORKDIR /workspace/group

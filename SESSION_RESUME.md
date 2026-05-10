@@ -30,20 +30,20 @@ alias resume-nanoclaw='claude --resume 178f85b3-77ba-446a-baf7-96816c6077d3'
 - **F1 uv** — pinned to 0.11.11 in container Dockerfile.
 - **F2 codex CLI** — pinned to 0.128.0; `~/.codex/auth.json` mounted; `NO_PROXY` default in container env.
 - **F3 gh CLI + OneCLI** — installed gh 2.92.0 in Dockerfile; `GH_TOKEN=gho_dummy` default; OneCLI agent `79eec2d8-cc6a-4b5b-aae2-afb40459842a` flipped to `mode=all`. Verified via Discord: `gh api user` returns `BlueShifTA`.
+- **F4 RTK** (2026-05-10, commit 15dd5a3) — host RTK config mount + container path. Binary stays on persistent volume.
+- **F5 Serena + Context7 MCP** (2026-05-10, commit 972cf48) — Dockerfile installs `serena` via uv tool (UV_TOOL_BIN_DIR=/usr/local/bin) and `context7-mcp@2.2.4` via pnpm. Smoke-tested in `nanoclaw-agent-v2-8d820e2c:latest`. Per-group registration is via container.json `mcpServers`.
+- **F6 QMD container MCP** (2026-05-10) — Dockerfile installs `@tobilu/qmd@2.1.0` via pnpm (better-sqlite3 added to build-script allowlist). Symlinks `/home/armywander/{Projects,.cache,.config}` → `/workspace/extra/{vault,armlab,altruistic,qmd-cache,qmd-config}` so the host index's stored paths resolve inside the container; `/home/node/.{cache,config}/qmd` symlinked through to the same. Host `~/.cache/qmd` + `~/.config/qmd` mounted RO via container.json. MCP stdio handshake verified: `query`, `get`, `multi_get`, `status` tools exposed; 888 docs (wiki/armlab/altruistic). Path stub bakes the `armywander` username — fork-specific.
 
-## What's pending — F4–F8
+## What's pending — F7–F8
 
 Each is a separate task-run, sequential, with TDD where it makes sense. Pick up by reading `docs/v1-fork-reference.md` (full index) and starting the next one.
 
 | # | Feature | Touches | Est | Notes for next session |
 |---|---------|---------|-----|------------------------|
-| F4 | RTK token-saving CLI | container env + bashrc + PreToolUse hook | 2h | Binary already at `/workspace/extra/armlab/bin/rtk` per memory. Just hook wiring. |
-| F5 | Serena + Context7 MCP in container | Dockerfile (`uv tool install serena-agent`) + `container/agent-runner/src/mcp-tools/index.ts` | 3h | F1 unblocks Serena (uses uv). Context7 is npm. |
-| F6 | QMD semantic search + GPU passthrough | Dockerfile + container-runner.ts + container MCP wiring | 4–8h | First check `upstream/skill/qmd` branch — may already cover most of this. `qmd-cache` mount already in container.json. |
 | F7 | Session commands `/ping /kill /reset /last /btw` + drift detection | host-only: `src/command-gate.ts` + new handlers + tests | 6h | TDD-friendly. v2 only has `/compact` today. |
 | F8 | `send_media` MCP tool (Discord media) | DB schema + `messages_out` + delivery + adapter + new MCP tool | 8h | Heaviest; cross-cutting. |
 
-Total remaining ≈ 23–27 h.
+Total remaining ≈ 14h.
 
 ## Key state references
 
