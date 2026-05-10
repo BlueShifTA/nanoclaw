@@ -24,6 +24,7 @@ ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 ARG CODEX_VERSION=0.128.0
+ARG CONTEXT7_VERSION=2.2.4
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -141,6 +142,20 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@openai/codex@${CODEX_VERSION}"
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "@upstash/context7-mcp@${CONTEXT7_VERSION}"
+
+# ---- Serena MCP (semantic code navigation) -----------------------------------
+# Installed via uv tool with UV_TOOL_BIN_DIR=/usr/local/bin so the binary lands
+# where the non-root `node` user can call it. Prerelease allowed (serena is
+# pre-1.0). Image grows ~150 MB (Python 3.13 toolchain + deps).
+ENV UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv tool install -p 3.13 'serena-agent@latest' --prerelease=allow \
+    && chmod -R a+rX /opt/uv-tools /opt/uv-python \
+    && serena --help > /dev/null
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
