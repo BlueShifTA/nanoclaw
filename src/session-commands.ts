@@ -70,8 +70,20 @@ function writeReply(ctx: SessionCommandContext, text: string): void {
   });
 }
 
+/**
+ * Wrap a multi-line report body in a fenced code block so the Discord
+ * chat adapter — which round-trips outgoing markdown through an AST and
+ * collapses single newlines to spaces — renders it verbatim with
+ * column alignment preserved. The optional header line goes outside the
+ * fence so it can use bold/italic.
+ */
+function renderReport(header: string | undefined, body: string[]): string {
+  const fence = ['```', ...body, '```'].join('\n');
+  return header ? `${header}\n${fence}` : fence;
+}
+
 async function handlePing(_args: string, ctx: SessionCommandContext): Promise<void> {
-  const lines: string[] = ['*Session status*'];
+  const lines: string[] = [];
 
   const running = isContainerRunning(ctx.session.id);
   lines.push(`Container : ${running ? 'running' : 'idle'}`);
@@ -164,7 +176,7 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
   }
   lines.push(`Messages   : ${inCount} in, ${outCount} out`);
 
-  writeReply(ctx, lines.join('\n'));
+  writeReply(ctx, renderReport('**Session status**', lines));
 }
 
 function formatAge(ms: number): string {
@@ -247,7 +259,7 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
     });
   }
 
-  const lines: string[] = ['*Session reset*'];
+  const lines: string[] = [];
   lines.push(`Messages : ${inCount} in, ${outCount} out`);
   if (firstTs && lastTs && firstTs !== lastTs) {
     lines.push(`Span     : ${firstTs} → ${lastTs}`);
@@ -263,7 +275,7 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
     lines.push(`Snapshot : ${snapshotRel}`);
   }
   lines.push('Next message starts a fresh conversation.');
-  writeReply(ctx, lines.join('\n'));
+  writeReply(ctx, renderReport('**Session reset**', lines));
 }
 
 interface SnapshotPayload {
@@ -385,7 +397,7 @@ async function handleLast(_args: string, ctx: SessionCommandContext): Promise<vo
     outboundDb.close();
   }
 
-  const lines: string[] = ['*Last interaction*'];
+  const lines: string[] = [];
   if (lastInbound) {
     lines.push(`In  (${lastInbound.timestamp}): ${truncate(extractText(lastInbound.content), 200)}`);
   } else {
@@ -396,7 +408,7 @@ async function handleLast(_args: string, ctx: SessionCommandContext): Promise<vo
   } else {
     lines.push('Out : (none)');
   }
-  writeReply(ctx, lines.join('\n'));
+  writeReply(ctx, renderReport('**Last interaction**', lines));
 }
 
 async function handleBtw(args: string, ctx: SessionCommandContext): Promise<void> {

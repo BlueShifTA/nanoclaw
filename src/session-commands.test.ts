@@ -116,6 +116,33 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('reply rendering — fenced code block preserves whitespace on Discord', () => {
+  // The Discord chat adapter parses outgoing `markdown` into a markdown
+  // AST then re-emits — single newlines collapse to spaces under
+  // standard paragraph semantics. Replies that need column alignment
+  // (the multi-line status reports) MUST live inside a ```...``` fence
+  // so Discord renders the body verbatim, monospace.
+  it('/ping reply body is wrapped in a fenced code block', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/```[\s\S]*Container[\s\S]*```/);
+  });
+
+  it('/reset reply body is wrapped in a fenced code block', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/```[\s\S]*Messages[\s\S]*```/);
+  });
+
+  it('/last reply body is wrapped in a fenced code block', async () => {
+    await handleSessionCommand('/last', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/```[\s\S]*In[\s\S]*```/);
+  });
+});
+
 describe('/ping — container status report', () => {
   it('reports container state (idle when not running)', async () => {
     mockIsContainerRunning.mockReturnValue(false);
