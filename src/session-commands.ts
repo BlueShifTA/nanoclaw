@@ -358,8 +358,13 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
         `2. ALWAYS append a one-line entry to \`/workspace/extra/armlab/.claude/memory/MEMORY.md\` pointing at the journal file you just wrote, with a SHORT (≤80 char) tag for what the session was about. Format:\n` +
         `   \`- [${new Date().toISOString().slice(0, 10)} session](../journal/<filename>.md) — <tag>\`\n` +
         `   This is not optional. Even an empty session gets one line ("no work, idle session") so the chronology is preserved.\n\n` +
-        `3. Reply with a SHORT human-readable summary (under 200 words) ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
-        'Do NOT start new work or run unrelated tools. Just write the two files and reply with the summary. The continuation will be cleared immediately after your reply.',
+        `3. Dispatch the **librarian** sub-agent (Agent tool with \`subagent_type=librarian\`) to index and digest the journal entry — pass the journal path \`${journalPath}\` and ask it to:\n` +
+        `   - Read the journal\n` +
+        `   - Cross-link to relevant existing wiki pages in \`/workspace/extra/vault/\`\n` +
+        `   - If anything is wiki-worthy (decision, concept, entity introduced this session), follow the relevant write protocol at \`/workspace/extra/wiki-framework/.skills/\` (\`wiki-capture\` for ad-hoc notes, \`wiki-ingest\` if it should become a full page, \`cross-linker\` for connections)\n` +
+        `   - Report back what it ingested / cross-linked (or "nothing wiki-worthy this session")\n\n` +
+        `4. Reply to me with a SHORT human-readable summary (under 200 words) of what you wrote + what the librarian ingested, ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
+        'Do NOT start new work or run unrelated tools. Just write the two files, dispatch the librarian, and reply with the summary. The continuation will be cleared immediately after your reply.',
       reset_request: true,
     }),
     trigger: 1,
