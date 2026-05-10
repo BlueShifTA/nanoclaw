@@ -162,6 +162,84 @@ describe('/ping — container status report', () => {
     await handleSessionCommand('/ping', '', ctx());
     expect(mockKillContainer).not.toHaveBeenCalled();
   });
+
+  it('reports activity state — idle when nothing is in-flight', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toContain('Activity');
+    expect(text).toMatch(/idle/i);
+  });
+
+  it('reports activity state — processing when messages_in has status=processing', async () => {
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
+         VALUES ('msg-proc', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', datetime('now'), '{"text":"hi"}', 'processing', 1)`,
+      )
+      .run();
+    inDb.close();
+
+    mockIsContainerRunning.mockReturnValue(true);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/processing/i);
+    expect(text).toMatch(/1 message/i);
+  });
+
+  it('reports scheduled-tasks state — count of pending tasks with process_after in the future', async () => {
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, process_after, content, status, trigger)
+         VALUES ('task-1', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in),
+                 'task', datetime('now'), datetime('now', '+1 hour'),
+                 '{"text":"future task"}', 'pending', 1)`,
+      )
+      .run();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, process_after, content, status, trigger)
+         VALUES ('task-2', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in),
+                 'task', datetime('now'), datetime('now', '+2 hour'),
+                 '{"text":"another task"}', 'pending', 1)`,
+      )
+      .run();
+    inDb.close();
+
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/Scheduled/i);
+    expect(text).toMatch(/2 task/i);
+  });
+
+  it('reports scheduled-tasks state — "none" when no future tasks pending', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/Scheduled.*none/i);
+  });
+
+  it('reports a due (overdue) scheduled task differently from future ones', async () => {
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, process_after, content, status, trigger)
+         VALUES ('task-due', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in),
+                 'task', datetime('now', '-2 hour'), datetime('now', '-1 hour'),
+                 '{"text":"overdue task"}', 'pending', 1)`,
+      )
+      .run();
+    inDb.close();
+
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/ping', '', ctx());
+    const text = outboundText() ?? '';
+    // "1 due" (overdue), 0 future — host-sweep will fire it on the next tick.
+    expect(text).toMatch(/1 due|overdue|1 task.*due/i);
+  });
 });
 
 describe('/reset', () => {

@@ -79,8 +79,11 @@ describe('agent-prompt MCP tool references', () => {
 
   it('every reference resolves to a registered tool', () => {
     const unresolved = refs.filter((r) => !registered.has(r.tool));
-    expect(unresolved, `${unresolved.length} unresolved references:\n${unresolved
-      .map((r) => `  ${r.file}:${r.line}  mcp__nanoclaw__${r.tool}`)
-      .join('\n')}\n\nRegistered tools: ${[...registered].sort().join(', ')}`).toEqual([]);
+    expect(
+      unresolved,
+      `${unresolved.length} unresolved references:\n${unresolved
+        .map((r) => `  ${r.file}:${r.line}  mcp__nanoclaw__${r.tool}`)
+        .join('\n')}\n\nRegistered tools: ${[...registered].sort().join(', ')}`,
+    ).toEqual([]);
   });
 });

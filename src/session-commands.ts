@@ -75,6 +75,58 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
   const running = isContainerRunning(ctx.session.id);
   lines.push(`Container : ${running ? 'running' : 'idle'}`);
 
+  // Activity — distinct from "is the docker container alive". A session is
+  // "processing" when an inbound row is in status='processing' (the
+  // container has claimed it and is mid-turn).
+  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
+  let inCount = 0;
+  let processingCount = 0;
+  let scheduledFuture = 0;
+  let scheduledDue = 0;
+  try {
+    inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
+    processingCount = (
+      inDb.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE status = 'processing'").get() as { c: number }
+    ).c;
+    scheduledFuture = (
+      inDb
+        .prepare(
+          `SELECT COUNT(*) AS c FROM messages_in
+           WHERE kind = 'task' AND status = 'pending'
+             AND process_after IS NOT NULL
+             AND datetime(process_after) > datetime('now')`,
+        )
+        .get() as { c: number }
+    ).c;
+    scheduledDue = (
+      inDb
+        .prepare(
+          `SELECT COUNT(*) AS c FROM messages_in
+           WHERE kind = 'task' AND status = 'pending'
+             AND process_after IS NOT NULL
+             AND datetime(process_after) <= datetime('now')`,
+        )
+        .get() as { c: number }
+    ).c;
+  } finally {
+    inDb.close();
+  }
+
+  if (processingCount > 0) {
+    lines.push(`Activity  : processing ${processingCount} message${processingCount === 1 ? '' : 's'}`);
+  } else {
+    lines.push('Activity  : idle');
+  }
+
+  if (scheduledFuture === 0 && scheduledDue === 0) {
+    lines.push('Scheduled : none');
+  } else {
+    const parts: string[] = [];
+    if (scheduledFuture > 0) parts.push(`${scheduledFuture} task${scheduledFuture === 1 ? '' : 's'} pending`);
+    if (scheduledDue > 0) parts.push(`${scheduledDue} due`);
+    lines.push(`Scheduled : ${parts.join(', ')}`);
+  }
+
   if (ctx.session.last_active) {
     lines.push(`Last active: ${ctx.session.last_active}`);
   } else {
@@ -91,24 +143,17 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
     lines.push('Heartbeat  : (none)');
   }
 
-  // Continuation pointer per provider.
+  // Continuation pointer per provider + message counts.
   const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
   let conts: Array<{ key: string }> = [];
   let outCount = 0;
-  let inCount = 0;
   try {
-    conts = outDb
-      .prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key")
-      .all() as Array<{ key: string }>;
+    conts = outDb.prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key").all() as Array<{
+      key: string;
+    }>;
     outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
   } finally {
     outDb.close();
-  }
-  const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
-  try {
-    inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
-  } finally {
-    inDb.close();
   }
 
   if (conts.length === 0) {
@@ -164,9 +209,9 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
   try {
     outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
     providers = (
-      outDb
-        .prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key")
-        .all() as Array<{ key: string }>
+      outDb.prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key").all() as Array<{
+        key: string;
+      }>
     ).map((r) => r.key.replace('continuation:', ''));
     const result = outDb.prepare("DELETE FROM session_state WHERE key LIKE 'continuation:%'").run();
     cleared = result.changes;
