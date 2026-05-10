@@ -46,12 +46,20 @@ function copyTree(src: string, dst: string): number {
     const s = path.join(src, entry.name);
     const d = path.join(dst, entry.name);
 
+    if (entry.isSymbolicLink()) {
+      // Skip dangling symlinks (e.g. v1's .claude/debug/latest pointer).
+      if (!fs.existsSync(s)) continue;
+      if (fs.existsSync(d)) continue;
+      // Preserve symlinks (e.g. uv venv's lib64 -> lib) instead of copying
+      // through them — copyFileSync follows symlinks and EISDIRs on dir targets.
+      fs.symlinkSync(fs.readlinkSync(s), d);
+      written += 1;
+      continue;
+    }
     if (entry.isDirectory()) {
       written += copyTree(s, d);
       continue;
     }
-    // Skip dangling symlinks (e.g. v1's .claude/debug/latest pointer).
-    if (entry.isSymbolicLink() && !fs.existsSync(s)) continue;
     if (fs.existsSync(d)) continue;
     fs.copyFileSync(s, d);
     written += 1;
