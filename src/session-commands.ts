@@ -142,8 +142,9 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
   }
   lines.push(agentLine);
 
-  // Session: id prefix — v1 truncates to 8 chars; do the same.
-  lines.push(`Session: ${ctx.session.id.slice(0, 8)}…`);
+  // Session: full id (v1 truncated to 8 chars but the operator finds the
+  // full hash more useful — easier to grep logs/DB files by it).
+  lines.push(`Session: ${ctx.session.id}`);
 
   if (scheduledFuture === 0 && scheduledDue === 0) {
     lines.push('Scheduled : none');

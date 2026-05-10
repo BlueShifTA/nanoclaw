@@ -150,13 +150,10 @@ describe('v1-parity: /ping', () => {
     expect(lastOutboundText()).toMatch(/Agent:.*(processing|container alive)/i);
   });
 
-  it('includes Session: line with id prefix or "none"', async () => {
+  it('includes Session: line with FULL id (operator preference — overrides v1 truncation)', async () => {
     mockIsContainerRunning.mockReturnValue(false);
     await handleSessionCommand('/ping', '', ctx());
-    // v1 prints `Session: <id-prefix>…` truncated to 8 chars. Our session id
-    // is "sess-v1-parity" which starts with "sess-v1-" (8 chars). Match the
-    // 8-char prefix OR the literal "none".
-    expect(lastOutboundText()).toMatch(/Session:\s+(sess-v1-|none)/);
+    expect(lastOutboundText()).toMatch(new RegExp(`Session:\\s+${SESSION_ID}`));
   });
 
   it('includes Last activity: line', async () => {
@@ -402,9 +399,7 @@ describe('v1-parity: /reset', () => {
     expect(reply).toMatch(/no active|cleared|empty/i);
     // And: no reset-req-* in inbound (didn't bother the agent).
     const db = new Database(inboundDbPath(AGENT_GROUP, SESSION_ID));
-    const row = db
-      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'reset-req-%'")
-      .get() as { c: number };
+    const row = db.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'reset-req-%'").get() as { c: number };
     db.close();
     expect(row.c).toBe(0);
   });
