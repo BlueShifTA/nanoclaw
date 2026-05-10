@@ -7,10 +7,11 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-const { mockIsContainerRunning, mockKillContainer, TEST_DIR } = vi.hoisted(() => ({
+const { mockIsContainerRunning, mockKillContainer, TEST_DIR, TEST_GROUPS_DIR } = vi.hoisted(() => ({
   mockIsContainerRunning: vi.fn(),
   mockKillContainer: vi.fn(),
   TEST_DIR: '/tmp/nanoclaw-test-session-commands',
+  TEST_GROUPS_DIR: '/tmp/nanoclaw-test-session-commands-groups',
 }));
 
 vi.mock('./container-runner.js', () => ({
@@ -20,7 +21,7 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: TEST_DIR };
+  return { ...actual, DATA_DIR: TEST_DIR, GROUPS_DIR: TEST_GROUPS_DIR };
 });
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
@@ -91,7 +92,9 @@ function outboundText(): string | undefined {
 
 beforeEach(() => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_GROUPS_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(path.join(TEST_GROUPS_DIR, 'test'), { recursive: true });
   const db = initTestDb();
   runMigrations(db);
   createAgentGroup({
@@ -109,6 +112,7 @@ beforeEach(() => {
 afterEach(() => {
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_GROUPS_DIR, { recursive: true, force: true });
   vi.clearAllMocks();
 });
 
@@ -324,6 +328,70 @@ describe('/reset', () => {
     const text = outboundText() ?? '';
     expect(text).toMatch(/0 in/);
     expect(text).toMatch(/0 out/);
+  });
+
+  it('writes a session-history snapshot file to the group folder before clearing', async () => {
+    // Seed real content so the snapshot has something to record.
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
+         VALUES ('in-snap-1', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat',
+                 datetime('now'), '{"text":"the prompt"}', 'completed', 1)`,
+      )
+      .run();
+    inDb.close();
+    const outDb = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, content)
+         VALUES ('out-snap-1', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), datetime('now'),
+                 'chat', 'discord:guild:123', 'discord', '{"text":"the reply"}')`,
+      )
+      .run();
+    outDb.close();
+    seedContinuation('claude', 'continuation-abc');
+
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+
+    const historyDir = path.join(TEST_GROUPS_DIR, 'test', '.session-history');
+    expect(fs.existsSync(historyDir), '.session-history directory must exist').toBe(true);
+    const files = fs.readdirSync(historyDir).filter((f) => f.endsWith('.md'));
+    expect(files.length, 'one snapshot file should be written').toBe(1);
+
+    const content = fs.readFileSync(path.join(historyDir, files[0]), 'utf-8');
+    expect(content).toContain(SESSION_ID);
+    expect(content).toContain('the prompt');
+    expect(content).toContain('the reply');
+    expect(content).toMatch(/1 in/);
+    expect(content).toMatch(/1 out/);
+    expect(content).toContain('claude'); // continuation provider that was cleared
+  });
+
+  it('does not write a snapshot for a completely empty session (avoids zero-content clutter)', async () => {
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+    const historyDir = path.join(TEST_GROUPS_DIR, 'test', '.session-history');
+    const files = fs.existsSync(historyDir) ? fs.readdirSync(historyDir).filter((f) => f.endsWith('.md')) : [];
+    expect(files.length, 'no snapshot for empty session').toBe(0);
+  });
+
+  it('snapshot path mentioned in /reset reply', async () => {
+    const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
+         VALUES ('in-snap-path', (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat',
+                 datetime('now'), '{"text":"hi"}', 'completed', 1)`,
+      )
+      .run();
+    inDb.close();
+
+    mockIsContainerRunning.mockReturnValue(false);
+    await handleSessionCommand('/reset', '', ctx());
+    const text = outboundText() ?? '';
+    expect(text).toMatch(/.session-history/);
   });
 
   it('kills container if one is running so it cannot rewrite a stale continuation', async () => {

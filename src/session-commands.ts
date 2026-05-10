@@ -9,8 +9,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { killContainer, isContainerRunning } from './container-runner.js';
+import { getAgentGroup } from './db/agent-groups.js';
 import { log } from './log.js';
 
 const SESSIONS_ROOT = path.join(DATA_DIR, 'v2-sessions');
@@ -178,13 +179,17 @@ function formatAge(ms: number): string {
 
 async function handleReset(_args: string, ctx: SessionCommandContext): Promise<void> {
   // Summarise what's in the session BEFORE clearing — counts + time span
-  // — so the operator sees what got wiped. Then kill any live container
-  // so it can't write a stale continuation back, then delete the
-  // continuation rows.
+  // — and persist a markdown snapshot to the group's .session-history/
+  // folder so the agent can read it back on a future session. Then kill
+  // any live container so it can't write a stale continuation back, then
+  // delete the continuation rows.
   let inCount = 0;
   let outCount = 0;
   let firstTs: string | undefined;
   let lastTs: string | undefined;
+  let recentInbound: Array<{ timestamp: string; content: string }> = [];
+  let recentOutbound: Array<{ timestamp: string; content: string }> = [];
+
   const inDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
   try {
     inCount = (inDb.prepare('SELECT COUNT(*) AS c FROM messages_in').get() as { c: number }).c;
@@ -195,6 +200,11 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
       .get() as { first: string | null; last: string | null } | undefined;
     firstTs = span?.first ?? undefined;
     lastTs = span?.last ?? undefined;
+    recentInbound = inDb
+      .prepare(
+        "SELECT timestamp, content FROM messages_in WHERE kind IN ('chat', 'chat-sdk') ORDER BY seq DESC LIMIT 5",
+      )
+      .all() as Array<{ timestamp: string; content: string }>;
   } finally {
     inDb.close();
   }
@@ -208,6 +218,9 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
   let providers: string[] = [];
   try {
     outCount = (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+    recentOutbound = outDb
+      .prepare("SELECT timestamp, content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 5")
+      .all() as Array<{ timestamp: string; content: string }>;
     providers = (
       outDb.prepare("SELECT key FROM session_state WHERE key LIKE 'continuation:%' ORDER BY key").all() as Array<{
         key: string;
@@ -217,6 +230,21 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
     cleared = result.changes;
   } finally {
     outDb.close();
+  }
+
+  // Persist a snapshot file ONLY if there was meaningful content (avoid
+  // littering with empty resets). Skip when both in/out are zero.
+  let snapshotRel: string | undefined;
+  if (inCount > 0 || outCount > 0) {
+    snapshotRel = writeSessionSnapshot(ctx, {
+      inCount,
+      outCount,
+      firstTs,
+      lastTs,
+      providers,
+      recentInbound: recentInbound.slice().reverse(),
+      recentOutbound: recentOutbound.slice().reverse(),
+    });
   }
 
   const lines: string[] = ['*Session reset*'];
@@ -231,8 +259,94 @@ async function handleReset(_args: string, ctx: SessionCommandContext): Promise<v
   } else {
     lines.push('Cleared  : no active continuation');
   }
+  if (snapshotRel) {
+    lines.push(`Snapshot : ${snapshotRel}`);
+  }
   lines.push('Next message starts a fresh conversation.');
   writeReply(ctx, lines.join('\n'));
+}
+
+interface SnapshotPayload {
+  inCount: number;
+  outCount: number;
+  firstTs?: string;
+  lastTs?: string;
+  providers: string[];
+  recentInbound: Array<{ timestamp: string; content: string }>;
+  recentOutbound: Array<{ timestamp: string; content: string }>;
+}
+
+function writeSessionSnapshot(ctx: SessionCommandContext, p: SnapshotPayload): string | undefined {
+  const group = getAgentGroup(ctx.session.agent_group_id);
+  if (!group) {
+    log.warn('Snapshot skipped — agent group not found', { agentGroupId: ctx.session.agent_group_id });
+    return undefined;
+  }
+  const folder = path.join(GROUPS_DIR, group.folder, '.session-history');
+  try {
+    fs.mkdirSync(folder, { recursive: true });
+  } catch (err) {
+    log.warn('Snapshot directory create failed', { folder, error: (err as Error).message });
+    return undefined;
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = `${ctx.session.id}-${stamp}.md`;
+  const filePath = path.join(folder, file);
+
+  const md: string[] = [];
+  md.push(`# Session snapshot — ${ctx.session.id}`);
+  md.push('');
+  md.push(`- Reset at  : ${new Date().toISOString()}`);
+  if (p.firstTs && p.lastTs && p.firstTs !== p.lastTs) {
+    md.push(`- Span      : ${p.firstTs} → ${p.lastTs}`);
+  } else if (p.firstTs) {
+    md.push(`- Span      : ${p.firstTs}`);
+  }
+  md.push(`- Messages  : ${p.inCount} in, ${p.outCount} out`);
+  if (p.providers.length > 0) {
+    md.push(`- Cleared   : continuation for ${p.providers.join(', ')}`);
+  }
+  md.push('');
+  md.push('## Recent inbound (oldest → newest, up to 5)');
+  md.push('');
+  if (p.recentInbound.length === 0) {
+    md.push('_(none)_');
+  } else {
+    for (const row of p.recentInbound) {
+      md.push(`- **${row.timestamp}** — ${extractTextForSnapshot(row.content)}`);
+    }
+  }
+  md.push('');
+  md.push('## Recent outbound (oldest → newest, up to 5)');
+  md.push('');
+  if (p.recentOutbound.length === 0) {
+    md.push('_(none)_');
+  } else {
+    for (const row of p.recentOutbound) {
+      md.push(`- **${row.timestamp}** — ${extractTextForSnapshot(row.content)}`);
+    }
+  }
+  md.push('');
+
+  try {
+    fs.writeFileSync(filePath, md.join('\n'));
+  } catch (err) {
+    log.warn('Snapshot write failed', { filePath, error: (err as Error).message });
+    return undefined;
+  }
+  return path.join(group.folder, '.session-history', file);
+}
+
+function extractTextForSnapshot(raw: string): string {
+  try {
+    const p = JSON.parse(raw);
+    if (typeof p === 'string') return truncate(p, 300);
+    if (p && typeof p.text === 'string') return truncate(p.text, 300);
+  } catch {
+    // fall through
+  }
+  return truncate(raw, 300);
 }
 
 async function handleKill(_args: string, ctx: SessionCommandContext): Promise<void> {
