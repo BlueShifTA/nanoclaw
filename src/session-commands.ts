@@ -83,7 +83,10 @@ function renderReport(header: string | undefined, body: string[]): string {
 }
 
 async function handlePing(_args: string, ctx: SessionCommandContext): Promise<void> {
-  const lines: string[] = [];
+  // v1 contract (nanoclaw-v1/src/index.ts:661-731): the operator types /ping
+  // and expects "NanoClaw alive" + an Agent: line + a Session: line + a
+  // Last activity: line, optionally with a drift warning.
+  const lines: string[] = ['NanoClaw alive'];
 
   const running = isContainerRunning(ctx.session.id);
   lines.push(`Container : ${running ? 'running' : 'idle'}`);
@@ -125,11 +128,22 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
     inDb.close();
   }
 
-  if (processingCount > 0) {
-    lines.push(`Activity  : processing ${processingCount} message${processingCount === 1 ? '' : 's'}`);
+  // Agent: state line — v1 has four mutually-exclusive states. We can
+  // distinguish "no active container" vs "processing" via isContainerRunning,
+  // and "processing N msgs" vs "container alive, no inbound being processed"
+  // via the processing count.
+  let agentLine: string;
+  if (!running) {
+    agentLine = 'Agent: idle (no active container)';
+  } else if (processingCount > 0) {
+    agentLine = `Agent: processing (${processingCount} message${processingCount === 1 ? '' : 's'} in flight)`;
   } else {
-    lines.push('Activity  : idle');
+    agentLine = 'Agent: idle (container alive, waiting for input)';
   }
+  lines.push(agentLine);
+
+  // Session: id prefix — v1 truncates to 8 chars; do the same.
+  lines.push(`Session: ${ctx.session.id.slice(0, 8)}…`);
 
   if (scheduledFuture === 0 && scheduledDue === 0) {
     lines.push('Scheduled : none');
@@ -141,9 +155,9 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
   }
 
   if (ctx.session.last_active) {
-    lines.push(`Last active: ${ctx.session.last_active}`);
+    lines.push(`Last activity: ${ctx.session.last_active}`);
   } else {
-    lines.push('Last active: (never)');
+    lines.push('Last activity: none');
   }
 
   // Heartbeat freshness — file-mtime read, fast.
@@ -278,9 +292,7 @@ function readResetStats(ctx: SessionCommandContext): ResetStats {
 }
 
 async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
-  const journalPath = `/workspace/extra/armlab/journal/${new Date()
-    .toISOString()
-    .replace(/[:.]/g, '-')}-reset.md`;
+  const journalPath = `/workspace/extra/armlab/journal/${new Date().toISOString().replace(/[:.]/g, '-')}-reset.md`;
 
   // Write the summary-request inbound. trigger=1 wakes the agent.
   writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
@@ -519,63 +531,64 @@ function extractTextForSnapshot(raw: string): string {
 }
 
 async function handleKill(_args: string, ctx: SessionCommandContext): Promise<void> {
+  // v1 wording (nanoclaw-v1/src/index.ts:762-787): same status messages so
+  // operator muscle memory works across v1 and v2.
   if (!isContainerRunning(ctx.session.id)) {
-    writeReply(ctx, 'No container running for this session.');
+    writeReply(ctx, 'No active container to kill.');
     return;
   }
   killContainer(ctx.session.id, 'admin /kill');
-  writeReply(ctx, 'Container killed.');
+  writeReply(ctx, 'Container killed. Session preserved — use /reset if you want a fresh start.');
 }
 
-async function handleLast(_args: string, ctx: SessionCommandContext): Promise<void> {
-  // Pull the most recent inbound message and most recent outbound (delivered
-  // or pending) message so the operator can see where the conversation
-  // stands without re-reading the channel scrollback.
-  let lastInbound: { timestamp: string; content: string } | undefined;
-  let lastOutbound: { timestamp: string; content: string } | undefined;
+async function handleLast(args: string, ctx: SessionCommandContext): Promise<void> {
+  // v1 contract (nanoclaw-v1/src/index.ts:734-758):
+  //   - Optional N (1..10, default 1).
+  //   - Returns the last N BOT messages — outbound `kind='chat'` only.
+  //   - "No agent responses found." when there are no outbound chat rows.
+  //   - When N=1, single block "<ts>\n<content>". When N>1, numbered with
+  //     "[i] <ts>\n<content>" separated by "---".
+  const requested = parseInt(args.trim(), 10);
+  const n = Math.min(Math.max(Number.isFinite(requested) ? requested : 1, 1), 10);
 
-  const inboundDb = openInboundDb(ctx.session.agent_group_id, ctx.session.id);
+  const outDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+  let rows: Array<{ timestamp: string; content: string }> = [];
   try {
-    lastInbound = inboundDb
-      .prepare(
-        "SELECT timestamp, content FROM messages_in WHERE kind IN ('chat', 'chat-sdk') ORDER BY seq DESC LIMIT 1",
-      )
-      .get() as { timestamp: string; content: string } | undefined;
+    rows = outDb
+      .prepare("SELECT timestamp, content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT ?")
+      .all(n) as Array<{ timestamp: string; content: string }>;
   } finally {
-    inboundDb.close();
+    outDb.close();
   }
 
-  const outboundDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
-  try {
-    lastOutbound = outboundDb
-      .prepare("SELECT timestamp, content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1")
-      .get() as { timestamp: string; content: string } | undefined;
-  } finally {
-    outboundDb.close();
+  if (rows.length === 0) {
+    writeReply(ctx, 'No agent responses found.');
+    return;
   }
 
-  const lines: string[] = [];
-  if (lastInbound) {
-    lines.push(`In  (${lastInbound.timestamp}): ${truncate(extractText(lastInbound.content), 200)}`);
-  } else {
-    lines.push('In  : (none)');
-  }
-  if (lastOutbound) {
-    lines.push(`Out (${lastOutbound.timestamp}): ${truncate(extractText(lastOutbound.content), 200)}`);
-  } else {
-    lines.push('Out : (none)');
-  }
-  writeReply(ctx, renderReport('**Last interaction**', lines));
+  // v1 ordered oldest-first in the output; we mimic that.
+  const ordered = rows.slice().reverse();
+  const blocks = ordered.map((row, i) => {
+    const prefix = ordered.length > 1 ? `[${i + 1}] ${row.timestamp}\n` : `${row.timestamp}\n`;
+    return prefix + extractText(row.content);
+  });
+  const body = blocks.join('\n---\n');
+  // Code-fence the body so Discord preserves whitespace and newlines.
+  writeReply(ctx, renderReport(undefined, [body]));
 }
 
 async function handleBtw(args: string, ctx: SessionCommandContext): Promise<void> {
   // Stash the operator's note into inbound.db with trigger=0 so it sits in
-  // the agent's next context batch without waking the container right now.
-  // The next real (triggering) message will see it.
-  if (!args) {
-    writeReply(ctx, 'Usage: /btw <note>. Stashes the note into the next message batch without replying.');
-    return;
-  }
+  // the agent's next context batch without waking the container now. The
+  // text is prefixed with the v1 marker (nanoclaw-v1/src/index.ts:966) so
+  // the agent reads it as a side note rather than as a prompt to act on.
+  //
+  // Empty /btw is a silent no-op — matches v1's behavior of returning
+  // without an error message.
+  const trimmed = args.trim();
+  if (!trimmed) return;
+
+  const prefixed = `[btw — side note, no response needed unless relevant]: ${trimmed}`;
   writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
     id: `btw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
@@ -583,10 +596,10 @@ async function handleBtw(args: string, ctx: SessionCommandContext): Promise<void
     platformId: ctx.deliveryAddr.platformId,
     channelType: ctx.deliveryAddr.channelType,
     threadId: ctx.deliveryAddr.threadId,
-    content: JSON.stringify({ text: args, btw: true }),
+    content: JSON.stringify({ text: prefixed, btw: true }),
     trigger: 0,
   });
-  writeReply(ctx, `Noted — stashed for the next batch (${args.length} chars).`);
+  writeReply(ctx, `Noted — stashed for the next batch (${trimmed.length} chars).`);
 }
 
 function extractText(rawContent: string): string {

@@ -139,10 +139,16 @@ describe('reply rendering — fenced code block preserves whitespace on Discord'
     expect(text).toMatch(/```[\s\S]*Messages[\s\S]*```/);
   });
 
-  it('/last reply body is wrapped in a fenced code block', async () => {
+  it('/last reply body is wrapped in a fenced code block when results exist', async () => {
+    const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
+    db.prepare(
+      `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, content)
+       VALUES ('o', 2, datetime('now'), 'chat', 'discord:guild:123', 'discord', '{"text":"hello"}')`,
+    ).run();
+    db.close();
     await handleSessionCommand('/last', '', ctx());
     const text = outboundText() ?? '';
-    expect(text).toMatch(/```[\s\S]*In[\s\S]*```/);
+    expect(text).toMatch(/```[\s\S]*hello[\s\S]*```/);
   });
 });
 
@@ -197,15 +203,14 @@ describe('/ping — container status report', () => {
     expect(mockKillContainer).not.toHaveBeenCalled();
   });
 
-  it('reports activity state — idle when nothing is in-flight', async () => {
+  it('reports agent state — idle when no container running', async () => {
     mockIsContainerRunning.mockReturnValue(false);
     await handleSessionCommand('/ping', '', ctx());
     const text = outboundText() ?? '';
-    expect(text).toContain('Activity');
-    expect(text).toMatch(/idle/i);
+    expect(text).toMatch(/Agent:.*idle/i);
   });
 
-  it('reports activity state — processing when messages_in has status=processing', async () => {
+  it('reports agent state — processing when messages_in has status=processing', async () => {
     const inDb = openInboundDb(AGENT_GROUP, SESSION_ID);
     inDb
       .prepare(
@@ -218,7 +223,7 @@ describe('/ping — container status report', () => {
     mockIsContainerRunning.mockReturnValue(true);
     await handleSessionCommand('/ping', '', ctx());
     const text = outboundText() ?? '';
-    expect(text).toMatch(/processing/i);
+    expect(text).toMatch(/Agent:.*processing/i);
     expect(text).toMatch(/1 message/i);
   });
 
@@ -439,9 +444,10 @@ describe('/reset — agent-driven summary then clear (default)', () => {
   }
   function seedContinuation(provider: string, value: string): void {
     const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
-    db.prepare(
-      "INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-    ).run(`continuation:${provider}`, value);
+    db.prepare("INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, datetime('now'))").run(
+      `continuation:${provider}`,
+      value,
+    );
     db.close();
   }
   /** Simulate the container writing the agent's summary reply (with sentinel). */
@@ -471,12 +477,17 @@ describe('/reset — agent-driven summary then clear (default)', () => {
     mockIsContainerRunning.mockReturnValue(false);
 
     // Pre-write the agent's sentinel reply so the poll resolves immediately.
-    injectAgentReply('Summary: discussed the F-series migration. Wrote /workspace/extra/armlab/journal/2026-05-11.md. __SESSION_RESET_SUMMARY_COMPLETE__');
+    injectAgentReply(
+      'Summary: discussed the F-series migration. Wrote /workspace/extra/armlab/journal/2026-05-11.md. __SESSION_RESET_SUMMARY_COMPLETE__',
+    );
 
     await handleSessionCommand('/reset', '', ctx());
 
     const ids = listInboundIds();
-    expect(ids.some((id) => id.startsWith('reset-req-')), 'a reset-req-* row must be in inbound').toBe(true);
+    expect(
+      ids.some((id) => id.startsWith('reset-req-')),
+      'a reset-req-* row must be in inbound',
+    ).toBe(true);
     expect(mockWakeContainer).toHaveBeenCalled();
   });
 
@@ -485,7 +496,9 @@ describe('/reset — agent-driven summary then clear (default)', () => {
     seedContinuation('claude', 'abc');
     mockIsContainerRunning.mockReturnValue(false);
 
-    injectAgentReply('Wrote journal at /workspace/extra/armlab/journal/2026-05-11.md __SESSION_RESET_SUMMARY_COMPLETE__');
+    injectAgentReply(
+      'Wrote journal at /workspace/extra/armlab/journal/2026-05-11.md __SESSION_RESET_SUMMARY_COMPLETE__',
+    );
 
     await handleSessionCommand('/reset', '', ctx());
 
@@ -518,7 +531,10 @@ describe('/reset — agent-driven summary then clear (default)', () => {
     await handleSessionCommand('/reset', '--quick', ctx());
 
     const ids = listInboundIds();
-    expect(ids.some((id) => id.startsWith('reset-req-')), 'no reset-req in inbound for --quick').toBe(false);
+    expect(
+      ids.some((id) => id.startsWith('reset-req-')),
+      'no reset-req in inbound for --quick',
+    ).toBe(false);
     expect(mockWakeContainer).not.toHaveBeenCalled();
     const outDb = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
     const remaining = (
@@ -596,31 +612,23 @@ describe('/reset — agent-driven summary then clear (default)', () => {
 });
 
 describe('/kill', () => {
-  it('calls killContainer when one is running', async () => {
+  it('calls killContainer when one is running and mentions /reset', async () => {
     mockIsContainerRunning.mockReturnValue(true);
     await handleSessionCommand('/kill', '', ctx());
     expect(mockKillContainer).toHaveBeenCalledWith(SESSION_ID, 'admin /kill');
-    expect(outboundText()).toBe('Container killed.');
+    expect(outboundText()).toMatch(/Container killed/);
+    expect(outboundText()).toMatch(/\/reset/);
   });
 
-  it('replies "no container" without invoking killContainer when idle', async () => {
+  it('replies "no active container" without invoking killContainer when idle', async () => {
     mockIsContainerRunning.mockReturnValue(false);
     await handleSessionCommand('/kill', '', ctx());
     expect(mockKillContainer).not.toHaveBeenCalled();
-    expect(outboundText()).toMatch(/No container running/);
+    expect(outboundText()).toMatch(/No active container/);
   });
 });
 
-describe('/last', () => {
-  function seedInbound(text: string): void {
-    const db = openInboundDb(AGENT_GROUP, SESSION_ID);
-    db.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, content, status, trigger)
-       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', datetime('now'), ?, 'pending', 1)`,
-    ).run(`in-${Date.now()}-${Math.random()}`, JSON.stringify({ text }));
-    db.close();
-  }
-
+describe('/last (v1-aligned: bot outputs only)', () => {
   function seedOutbound(text: string): void {
     const db = new Database(outboundDbPath(AGENT_GROUP, SESSION_ID));
     db.prepare(
@@ -630,32 +638,17 @@ describe('/last', () => {
     db.close();
   }
 
-  it('reports "(none)" for both sides on an empty session', async () => {
+  it('reports "No agent responses found." on an empty session', async () => {
     await handleSessionCommand('/last', '', ctx());
-    const text = outboundText() ?? '';
-    expect(text).toMatch(/Last interaction/);
-    expect(text).toMatch(/In  : \(none\)/);
-    expect(text).toMatch(/Out : \(none\)/);
+    expect(outboundText()).toMatch(/No agent responses found/);
   });
 
-  it('shows the latest inbound and outbound texts', async () => {
-    seedInbound('earlier inbound');
-    seedInbound('the latest inbound');
+  it('shows the latest agent output (default N=1)', async () => {
     seedOutbound('the latest outbound');
 
     await handleSessionCommand('/last', '', ctx());
     const text = outboundText() ?? '';
-    expect(text).toContain('the latest inbound');
     expect(text).toContain('the latest outbound');
-    expect(text).not.toContain('earlier inbound');
-  });
-
-  it('truncates long messages', async () => {
-    seedInbound('x'.repeat(500));
-    await handleSessionCommand('/last', '', ctx());
-    const text = outboundText() ?? '';
-    expect(text).toContain('…');
-    expect(text.length).toBeLessThan(500);
   });
 });
 
@@ -672,19 +665,20 @@ describe('/btw', () => {
     }
   }
 
-  it('rejects empty args with a usage hint', async () => {
+  it('empty /btw is silent — no reply, no inbound row (v1 parity)', async () => {
     await handleSessionCommand('/btw', '', ctx());
-    expect(outboundText()).toMatch(/Usage:/);
+    expect(outboundText()).toBeUndefined();
     expect(listInboundContents()).toEqual([]);
   });
 
-  it('writes the note with trigger=0 so it does not wake the agent now', async () => {
+  it('writes the note with trigger=0 and v1 side-note prefix', async () => {
     await handleSessionCommand('/btw', 'remember the slack channel id is C123', ctx());
     const rows = listInboundContents();
     expect(rows).toHaveLength(1);
     expect(rows[0].trigger).toBe(0);
     const parsed = JSON.parse(rows[0].content);
-    expect(parsed.text).toBe('remember the slack channel id is C123');
+    expect(parsed.text).toMatch(/\[btw — side note, no response needed unless relevant\]:/);
+    expect(parsed.text).toContain('remember the slack channel id is C123');
     expect(parsed.btw).toBe(true);
   });
 
