@@ -350,67 +350,90 @@ function readResetStats(ctx: SessionCommandContext): ResetStats {
 async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
   const journalPath = `/workspace/extra/armlab/journal/${new Date().toISOString().replace(/[:.]/g, '-')}-reset.md`;
 
+  // Per-attempt timeout (default 10 min — long enough for a real summary
+  // turn including librarian dispatch) and retry count (default 3 — only
+  // then do we resort to clearing without a summary).
+  const timeoutMs = parseInt(process.env.NANOCLAW_RESET_TIMEOUT_MS ?? '600000', 10);
+  const maxAttempts = parseInt(process.env.NANOCLAW_RESET_MAX_ATTEMPTS ?? '3', 10);
+
   // Step 1/4: tell the operator what's about to happen so they aren't
-  // staring at a silent Discord channel for 60s.
+  // staring at a silent Discord channel for the whole timeout window.
   writeReply(
     ctx,
-    `🔄 /reset — step 1/4: asking the agent to write the session journal at \`${journalPath}\` + update MEMORY.md + dispatch the librarian. This usually takes 10–40s.`,
+    `🔄 /reset — step 1/4: asking the agent to write the session journal at \`${journalPath}\` + update MEMORY.md + dispatch the librarian. Up to ${maxAttempts} attempts × ${Math.round(timeoutMs / 60000)} min — the full summary can take minutes.`,
   );
 
-  // Capture max outbound seq BEFORE writing the request so the poll only
-  // sees NEW rows the agent wrote in response. Without this, a sentinel
-  // reply from a PREVIOUS /reset still sitting in outbound.db would match
-  // immediately and we'd surface a stale summary.
-  let startSeq = 0;
-  {
-    const seqDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
-    try {
-      startSeq = (seqDb.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM messages_out').get() as { s: number }).s;
-    } finally {
-      seqDb.close();
+  let poll: { found: true; summaryText: string } | { found: false } = { found: false };
+  let attemptUsed = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    attemptUsed = attempt;
+    // Capture max outbound seq BEFORE writing this attempt's request so the
+    // poll only sees NEW rows. Without this, a sentinel reply from a PREVIOUS
+    // /reset still in outbound.db would match instantly with a stale summary.
+    let startSeq = 0;
+    {
+      const seqDb = openOutboundDb(ctx.session.agent_group_id, ctx.session.id);
+      try {
+        startSeq = (seqDb.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM messages_out').get() as { s: number }).s;
+      } finally {
+        seqDb.close();
+      }
     }
+
+    if (attempt > 1) {
+      writeReply(
+        ctx,
+        `🔁 /reset — retry ${attempt}/${maxAttempts}: previous attempt timed out. Re-asking the agent (still ${Math.round(
+          timeoutMs / 60000,
+        )} min budget per attempt).`,
+      );
+    }
+
+    // Write the summary-request inbound. trigger=1 wakes the agent.
+    writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
+      id: `reset-req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: ctx.deliveryAddr.platformId,
+      channelType: ctx.deliveryAddr.channelType,
+      threadId: ctx.deliveryAddr.threadId,
+      content: JSON.stringify({
+        text:
+          '[SESSION RESET REQUEST] This conversation is about to be cleared. Before that, do ALL of:\n\n' +
+          `1. Write a session journal at \`${journalPath}\` — 5–10 bullets covering: what we worked on, decisions made, files touched, unfinished work, important learnings. Be specific (file paths, decision points), not vague.\n\n` +
+          `2. ALWAYS append a one-line entry to \`/workspace/extra/armlab/.claude/memory/MEMORY.md\` pointing at the journal file you just wrote, with a SHORT (≤80 char) tag for what the session was about. Format:\n` +
+          `   \`- [${new Date().toISOString().slice(0, 10)} session](../journal/<filename>.md) — <tag>\`\n` +
+          `   This is not optional. Even an empty session gets one line ("no work, idle session") so the chronology is preserved.\n\n` +
+          `3. Dispatch the **librarian** sub-agent (Agent tool with \`subagent_type=librarian\`) to index and digest the journal entry — pass the journal path \`${journalPath}\` and ask it to:\n` +
+          `   - Read the journal\n` +
+          `   - Cross-link to relevant existing wiki pages in \`/workspace/extra/vault/\`\n` +
+          `   - If anything is wiki-worthy (decision, concept, entity introduced this session), follow the relevant write protocol at \`/workspace/extra/wiki-framework/.skills/\` (\`wiki-capture\` for ad-hoc notes, \`wiki-ingest\` if it should become a full page, \`cross-linker\` for connections)\n` +
+          `   - Report back what it ingested / cross-linked (or "nothing wiki-worthy this session")\n\n` +
+          `4. Reply to me with a SHORT human-readable summary (under 200 words) of what you wrote + what the librarian ingested, ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
+          'Do NOT start new work or run unrelated tools. Just write the two files, dispatch the librarian, and reply with the summary. The continuation will be cleared immediately after your reply.',
+        reset_request: true,
+        reset_attempt: attempt,
+      }),
+      trigger: 1,
+    });
+
+    await wakeContainer(ctx.session);
+
+    poll = await pollForResetSummary(ctx, startSeq, timeoutMs);
+    if (poll.found) break;
   }
 
-  // Write the summary-request inbound. trigger=1 wakes the agent.
-  writeSessionMessage(ctx.session.agent_group_id, ctx.session.id, {
-    id: `reset-req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: ctx.deliveryAddr.platformId,
-    channelType: ctx.deliveryAddr.channelType,
-    threadId: ctx.deliveryAddr.threadId,
-    content: JSON.stringify({
-      text:
-        '[SESSION RESET REQUEST] This conversation is about to be cleared. Before that, do ALL of:\n\n' +
-        `1. Write a session journal at \`${journalPath}\` — 5–10 bullets covering: what we worked on, decisions made, files touched, unfinished work, important learnings. Be specific (file paths, decision points), not vague.\n\n` +
-        `2. ALWAYS append a one-line entry to \`/workspace/extra/armlab/.claude/memory/MEMORY.md\` pointing at the journal file you just wrote, with a SHORT (≤80 char) tag for what the session was about. Format:\n` +
-        `   \`- [${new Date().toISOString().slice(0, 10)} session](../journal/<filename>.md) — <tag>\`\n` +
-        `   This is not optional. Even an empty session gets one line ("no work, idle session") so the chronology is preserved.\n\n` +
-        `3. Dispatch the **librarian** sub-agent (Agent tool with \`subagent_type=librarian\`) to index and digest the journal entry — pass the journal path \`${journalPath}\` and ask it to:\n` +
-        `   - Read the journal\n` +
-        `   - Cross-link to relevant existing wiki pages in \`/workspace/extra/vault/\`\n` +
-        `   - If anything is wiki-worthy (decision, concept, entity introduced this session), follow the relevant write protocol at \`/workspace/extra/wiki-framework/.skills/\` (\`wiki-capture\` for ad-hoc notes, \`wiki-ingest\` if it should become a full page, \`cross-linker\` for connections)\n` +
-        `   - Report back what it ingested / cross-linked (or "nothing wiki-worthy this session")\n\n` +
-        `4. Reply to me with a SHORT human-readable summary (under 200 words) of what you wrote + what the librarian ingested, ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
-        'Do NOT start new work or run unrelated tools. Just write the two files, dispatch the librarian, and reply with the summary. The continuation will be cleared immediately after your reply.',
-      reset_request: true,
-    }),
-    trigger: 1,
-  });
-
-  await wakeContainer(ctx.session);
-
-  const timeoutMs = parseInt(process.env.NANOCLAW_RESET_TIMEOUT_MS ?? '60000', 10);
-  const poll = await pollForResetSummary(ctx, startSeq, timeoutMs);
-
   // Step 2/4 — tell the operator the wait is over (sentinel found OR
-  // timed out) and we're moving to cleanup.
+  // all retries exhausted) and we're moving to cleanup.
   if (poll.found) {
-    writeReply(ctx, '✅ /reset — step 2/4: agent finished the summary. Killing the container and clearing the conversation continuation…');
+    writeReply(
+      ctx,
+      `✅ /reset — step 2/4: agent finished the summary on attempt ${attemptUsed}/${maxAttempts}. Killing the container and clearing the conversation continuation…`,
+    );
   } else {
     writeReply(
       ctx,
-      `⏰ /reset — step 2/4: agent didn't reply within ${Math.round(timeoutMs / 1000)}s. Proceeding with cleanup anyway — you can recover with /kill + a fresh prompt.`,
+      `⏰ /reset — step 2/4: agent didn't reply across ${maxAttempts} attempts × ${Math.round(timeoutMs / 60000)} min each. Clearing anyway — recover with /kill if the container is wedged, then start a fresh prompt.`,
     );
   }
 
