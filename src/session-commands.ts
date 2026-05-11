@@ -350,6 +350,13 @@ function readResetStats(ctx: SessionCommandContext): ResetStats {
 async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats): Promise<void> {
   const journalPath = `/workspace/extra/armlab/journal/${new Date().toISOString().replace(/[:.]/g, '-')}-reset.md`;
 
+  // Step 1/4: tell the operator what's about to happen so they aren't
+  // staring at a silent Discord channel for 60s.
+  writeReply(
+    ctx,
+    `🔄 /reset — step 1/4: asking the agent to write the session journal at \`${journalPath}\` + update MEMORY.md + dispatch the librarian. This usually takes 10–40s.`,
+  );
+
   // Capture max outbound seq BEFORE writing the request so the poll only
   // sees NEW rows the agent wrote in response. Without this, a sentinel
   // reply from a PREVIOUS /reset still sitting in outbound.db would match
@@ -396,11 +403,30 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   const timeoutMs = parseInt(process.env.NANOCLAW_RESET_TIMEOUT_MS ?? '60000', 10);
   const poll = await pollForResetSummary(ctx, startSeq, timeoutMs);
 
+  // Step 2/4 — tell the operator the wait is over (sentinel found OR
+  // timed out) and we're moving to cleanup.
+  if (poll.found) {
+    writeReply(ctx, '✅ /reset — step 2/4: agent finished the summary. Killing the container and clearing the conversation continuation…');
+  } else {
+    writeReply(
+      ctx,
+      `⏰ /reset — step 2/4: agent didn't reply within ${Math.round(timeoutMs / 1000)}s. Proceeding with cleanup anyway — you can recover with /kill + a fresh prompt.`,
+    );
+  }
+
   // Always kill + clear after the wait, regardless of poll outcome.
   if (isContainerRunning(ctx.session.id)) {
     killContainer(ctx.session.id, 'admin /reset (post-summary)');
   }
   const cleared = clearContinuations(ctx);
+
+  // Step 3/4 — cleanup happened. Tell the operator before writing the
+  // snapshot so they see something land between the kill and the final
+  // report (snapshot write can take a moment for big sessions).
+  writeReply(
+    ctx,
+    `🧹 /reset — step 3/4: container killed, ${cleared} continuation${cleared === 1 ? '' : 's'} cleared. Writing session snapshot…`,
+  );
 
   // Snapshot file with the agent's summary appended (if we got one).
   let snapshotRel: string | undefined;
@@ -417,7 +443,7 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
     });
   }
 
-  // Compose final user-facing reply.
+  // Step 4/4 — the final consolidated report.
   const lines: string[] = [];
   lines.push(`Messages : ${stats.inCount} in, ${stats.outCount} out`);
   if (stats.firstTs && stats.lastTs && stats.firstTs !== stats.lastTs) {
@@ -438,7 +464,7 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   } else {
     lines.push('Summary  : timed out waiting for agent — cleared anyway.');
   }
-  writeReply(ctx, renderReport('**Session reset**', lines));
+  writeReply(ctx, renderReport('**🔄 /reset — step 4/4: complete**', lines));
 }
 
 function clearContinuations(ctx: SessionCommandContext): number {
