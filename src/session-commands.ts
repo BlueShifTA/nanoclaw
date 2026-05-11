@@ -564,7 +564,10 @@ function deriveTagFromSummary(summary: string | undefined): string {
     .map((l) => l.trim())
     .find((l) => l.length > 0);
   if (!firstLine) return 'session ended';
-  const stripped = firstLine.replace(/^[-*#>\s]+/, '').replace(/\*+/g, '').slice(0, 80);
+  const stripped = firstLine
+    .replace(/^[-*#>\s]+/, '')
+    .replace(/\*+/g, '')
+    .slice(0, 80);
   return stripped || 'session ended';
 }
 
