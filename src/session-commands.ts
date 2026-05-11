@@ -141,7 +141,13 @@ async function handlePing(_args: string, ctx: SessionCommandContext): Promise<vo
         .prepare("SELECT timestamp FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1")
         .get() as { timestamp: string } | undefined;
       if (row?.timestamp) {
-        const t = Date.parse(row.timestamp);
+        // SQLite `datetime('now')` returns 'YYYY-MM-DD HH:MM:SS' in UTC,
+        // with NO timezone marker. Date.parse treats unmarked strings as
+        // LOCAL time on Node — silentFor would be off by the host's TZ
+        // offset (e.g. CEST=+2h reports ~2h drift on every fresh agent
+        // turn). Force UTC interpretation by appending 'Z'.
+        const iso = row.timestamp.includes('T') ? row.timestamp : row.timestamp.replace(' ', 'T');
+        const t = Date.parse(iso.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z');
         if (Number.isFinite(t)) silentForMs = Date.now() - t;
       }
     } finally {
