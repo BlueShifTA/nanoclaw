@@ -428,8 +428,13 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   if (poll.found) {
     writeReply(
       ctx,
-      `✅ /reset — step 2/4: agent finished the summary on attempt ${attemptUsed}/${maxAttempts}. Killing the container and clearing the conversation continuation…`,
+      `✅ /reset — step 2/4: agent finished the summary on attempt ${attemptUsed}/${maxAttempts}. Posting the agent's summary, then killing the container and clearing the continuation…`,
     );
+    // Surface the agent's summary as its own message so the operator sees
+    // it while the cleanup runs (the snapshot write that follows can take
+    // a moment for big sessions). The final step 4/4 report only carries
+    // metadata; this is where the actual *content* lives.
+    writeReply(ctx, renderReport('**📝 Agent summary**', [poll.summaryText]));
   } else {
     writeReply(
       ctx,
@@ -481,11 +486,9 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
     lines.push(`Snapshot : ${snapshotRel}`);
   }
   if (poll.found) {
-    lines.push('');
-    lines.push('Agent summary:');
-    for (const l of poll.summaryText.split('\n')) lines.push(l);
+    lines.push(`Summary  : posted above (attempt ${attemptUsed}/${maxAttempts})`);
   } else {
-    lines.push('Summary  : timed out waiting for agent — cleared anyway.');
+    lines.push('Summary  : timed out across all retries — cleared anyway.');
   }
   writeReply(ctx, renderReport('**🔄 /reset — step 4/4: complete**', lines));
 }
