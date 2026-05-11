@@ -401,16 +401,13 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
         text:
           '[SESSION RESET REQUEST] This conversation is about to be cleared. Before that, do ALL of:\n\n' +
           `1. Write a session journal at \`${journalPath}\` — 5–10 bullets covering: what we worked on, decisions made, files touched, unfinished work, important learnings. Be specific (file paths, decision points), not vague.\n\n` +
-          `2. ALWAYS append a one-line entry to \`/workspace/extra/armlab/.claude/memory/MEMORY.md\` pointing at the journal file you just wrote, with a SHORT (≤80 char) tag for what the session was about. Format:\n` +
-          `   \`- [${new Date().toISOString().slice(0, 10)} session](../journal/<filename>.md) — <tag>\`\n` +
-          `   This is not optional. Even an empty session gets one line ("no work, idle session") so the chronology is preserved.\n\n` +
-          `3. Dispatch the **librarian** sub-agent (Agent tool with \`subagent_type=librarian\`) to index and digest the journal entry — pass the journal path \`${journalPath}\` and ask it to:\n` +
+          `2. Dispatch the **librarian** sub-agent (Agent tool with \`subagent_type=librarian\`) to index and digest the journal entry — pass the journal path \`${journalPath}\` and ask it to:\n` +
           `   - Read the journal\n` +
           `   - Cross-link to relevant existing wiki pages in \`/workspace/extra/vault/\`\n` +
           `   - If anything is wiki-worthy (decision, concept, entity introduced this session), follow the relevant write protocol at \`/workspace/extra/wiki-framework/.skills/\` (\`wiki-capture\` for ad-hoc notes, \`wiki-ingest\` if it should become a full page, \`cross-linker\` for connections)\n` +
           `   - Report back what it ingested / cross-linked (or "nothing wiki-worthy this session")\n\n` +
-          `4. Reply to me with a SHORT human-readable summary (under 200 words) of what you wrote + what the librarian ingested, ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
-          'Do NOT start new work or run unrelated tools. Just write the two files, dispatch the librarian, and reply with the summary. The continuation will be cleared immediately after your reply.',
+          `3. Reply to me with a SHORT human-readable summary (under 200 words) of what you wrote + what the librarian ingested, ending with this literal sentinel on its own line:\n${RESET_SENTINEL}\n\n` +
+          'Do NOT try to edit MEMORY.md — the host appends that index entry after this reply (your container has a sensitive-file guard on .claude/ paths). Do NOT start new work or run unrelated tools. Just write the journal, dispatch the librarian, and reply with the summary. The continuation will be cleared immediately after your reply.',
         reset_request: true,
         reset_attempt: attempt,
       }),
@@ -453,7 +450,7 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   // report (snapshot write can take a moment for big sessions).
   writeReply(
     ctx,
-    `🧹 /reset — step 3/4: container killed, ${cleared} continuation${cleared === 1 ? '' : 's'} cleared. Writing session snapshot…`,
+    `🧹 /reset — step 3/4: container killed, ${cleared} continuation${cleared === 1 ? '' : 's'} cleared. Writing session snapshot + MEMORY.md index entry…`,
   );
 
   // Snapshot file with the agent's summary appended (if we got one).
@@ -471,6 +468,15 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
     });
   }
 
+  // MEMORY.md append — done HOST-side because the container's SDK guards
+  // against edits inside `.claude/` directories. journalPath is the
+  // container path the agent wrote to; rewrite to the host path via the
+  // armlab mount root for the actual append.
+  const memoryAppend = appendMemoryIndex({
+    journalContainerPath: journalPath,
+    summaryText: poll.found ? poll.summaryText : undefined,
+  });
+
   // Step 4/4 — the final consolidated report.
   const lines: string[] = [];
   lines.push(`Messages : ${stats.inCount} in, ${stats.outCount} out`);
@@ -485,12 +491,81 @@ async function runAgentDrivenReset(ctx: SessionCommandContext, stats: ResetStats
   if (snapshotRel) {
     lines.push(`Snapshot : ${snapshotRel}`);
   }
+  if (memoryAppend.ok) {
+    lines.push(`MEMORY.md: appended — ${memoryAppend.relPath}`);
+  } else {
+    lines.push(`MEMORY.md: SKIPPED — ${memoryAppend.reason}`);
+  }
   if (poll.found) {
     lines.push(`Summary  : posted above (attempt ${attemptUsed}/${maxAttempts})`);
   } else {
     lines.push('Summary  : timed out across all retries — cleared anyway.');
   }
   writeReply(ctx, renderReport('**🔄 /reset — step 4/4: complete**', lines));
+}
+
+/** Append a one-line index entry to the host's MEMORY.md pointing at the
+ *  journal file the agent just wrote. The agent itself can't do this
+ *  (the Claude Code SDK in the container guards against edits inside
+ *  any `.claude/` directory, even with permissionMode=bypassPermissions).
+ *
+ *  journalContainerPath looks like `/workspace/extra/armlab/journal/<ts>.md`;
+ *  the armlab mount root on host is /home/armywander/Projects/ArmLab.io
+ *  (override via NANOCLAW_ARMLAB_HOST_ROOT). */
+function appendMemoryIndex(opts: {
+  journalContainerPath: string;
+  summaryText?: string;
+}): { ok: true; relPath: string } | { ok: false; reason: string } {
+  const containerArmlabRoot = '/workspace/extra/armlab';
+  if (!opts.journalContainerPath.startsWith(containerArmlabRoot + '/')) {
+    return { ok: false, reason: `journal path is outside ${containerArmlabRoot}` };
+  }
+  const hostArmlabRoot = process.env.NANOCLAW_ARMLAB_HOST_ROOT ?? '/home/armywander/Projects/ArmLab.io';
+  const rel = opts.journalContainerPath.slice(containerArmlabRoot.length + 1); // e.g. "journal/2026-05-11T....md"
+  const hostJournalPath = path.join(hostArmlabRoot, rel);
+  const memoryDir = path.join(hostArmlabRoot, '.claude', 'memory');
+  const memoryPath = path.join(memoryDir, 'MEMORY.md');
+
+  // MEMORY.md lives in .../.claude/memory/. Journal lives in .../journal/.
+  // The relative link from MEMORY.md to the journal is "../../journal/<file>".
+  const journalRelFromMemory = path.relative(memoryDir, hostJournalPath);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const tag = deriveTagFromSummary(opts.summaryText);
+  const line = `- [${today} session](${journalRelFromMemory}) — ${tag}`;
+
+  try {
+    fs.mkdirSync(memoryDir, { recursive: true });
+  } catch (err) {
+    return { ok: false, reason: `mkdir ${memoryDir}: ${(err as Error).message}` };
+  }
+
+  // Idempotency: don't double-append if the journal filename is already
+  // referenced (re-runs of /reset on the same minute would otherwise
+  // duplicate).
+  try {
+    const existing = fs.existsSync(memoryPath) ? fs.readFileSync(memoryPath, 'utf-8') : '';
+    if (existing.includes(path.basename(hostJournalPath))) {
+      return { ok: true, relPath: path.relative(hostArmlabRoot, memoryPath) + ' (entry already present)' };
+    }
+    const prefix = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(memoryPath, `${prefix}${line}\n`);
+    return { ok: true, relPath: path.relative(hostArmlabRoot, memoryPath) };
+  } catch (err) {
+    return { ok: false, reason: `write ${memoryPath}: ${(err as Error).message}` };
+  }
+}
+
+function deriveTagFromSummary(summary: string | undefined): string {
+  if (!summary) return 'no agent reply — clear after timeout';
+  // First non-empty line, stripped of markdown markers, capped at 80 chars.
+  const firstLine = summary
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  if (!firstLine) return 'session ended';
+  const stripped = firstLine.replace(/^[-*#>\s]+/, '').replace(/\*+/g, '').slice(0, 80);
+  return stripped || 'session ended';
 }
 
 function clearContinuations(ctx: SessionCommandContext): number {
