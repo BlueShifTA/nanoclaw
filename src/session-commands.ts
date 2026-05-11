@@ -252,22 +252,37 @@ function formatAge(ms: number): string {
  */
 const RESET_SENTINEL = '__SESSION_RESET_SUMMARY_COMPLETE__';
 
+/** Per-session lock to prevent two concurrent /reset calls from racing on
+ *  the sentinel match. Without this, both calls capture the same startSeq,
+ *  both poll, and the first sentinel reply satisfies both — second one
+ *  reports a summary that was actually for the first request. */
+const resetInFlight = new Set<string>();
+
 async function handleReset(args: string, ctx: SessionCommandContext): Promise<void> {
   const trimmed = args.trim();
   const quick = /^(--quick|--no-summary|--force|quick|force)$/i.test(trimmed);
 
-  // Gather pre-clear stats — both for the snapshot file and the reply.
-  const stats = readResetStats(ctx);
-
-  // Empty sessions: nothing to summarise — short-circuit to quick clear so
-  // the user isn't waiting 60s for an agent turn that has no content.
-  if (quick || stats.inCount === 0) {
-    return doClear(ctx, stats);
+  if (resetInFlight.has(ctx.session.id)) {
+    writeReply(ctx, 'A /reset is already in progress for this session — please wait.');
+    return;
   }
+  resetInFlight.add(ctx.session.id);
+  try {
+    // Gather pre-clear stats — both for the snapshot file and the reply.
+    const stats = readResetStats(ctx);
 
-  // Agent-driven flow: write a summary-request inbound, wake the container,
-  // poll outbound for the sentinel, then clear.
-  await runAgentDrivenReset(ctx, stats);
+    // Empty sessions: nothing to summarise — short-circuit to quick clear so
+    // the user isn't waiting 60s for an agent turn that has no content.
+    if (quick || stats.inCount === 0) {
+      return await doClear(ctx, stats);
+    }
+
+    // Agent-driven flow: write a summary-request inbound, wake the container,
+    // poll outbound for the sentinel, then clear.
+    await runAgentDrivenReset(ctx, stats);
+  } finally {
+    resetInFlight.delete(ctx.session.id);
+  }
 }
 
 interface ResetStats {
